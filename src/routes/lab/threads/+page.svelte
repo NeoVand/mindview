@@ -1,9 +1,5 @@
 <script lang="ts">
-	import { asset } from '$app/paths';
-	import { initGPU } from '$lib/engine/gpu';
-	import { ensureFonts } from '$lib/engine/text';
-	import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
-	import { Painter } from '$lib/runtime/painter';
+	import { labGPU, labModel, labPainter, releasePainting } from '$lib/lab/shared';
 	import { Threads, type ThreadsStatus } from '$lib/viz/threads';
 
 	let study: Threads | undefined;
@@ -57,16 +53,10 @@
 		canvas.addEventListener('wheel', wheel, { passive: false });
 
 		(async () => {
-			const gpu = await initGPU(canvas);
+			// the same device and reader as the other labs (kept when moving between them)
+			const gpu = await labGPU(canvas);
 			loading = 'Loading Ternary Bonsai 1.7B (460 MB)';
-			const [llm] = await Promise.all([
-				BonsaiLLM.load(
-					gpu.device,
-					asset('/models/ternary-bonsai-1.7b/model.gguf'),
-					(f) => (progress = f)
-				),
-				ensureFonts()
-			]);
+			const llm = await labModel(gpu.device, (f) => (progress = f));
 			if (!alive) return;
 			study = new Threads(gpu, llm, (s) => {
 				if (s.caption !== status?.caption || s.busy !== status?.busy) status = s;
@@ -80,7 +70,7 @@
 			ready = true;
 			// the painter (1.1 GB) downloads while the reader runs; the journey continues into it when it is ready
 			painterNote = 'The painter is downloading';
-			Painter.load(gpu.device, asset('/models/bonsai-image-4b'), (p) => {
+			labPainter(gpu.device, (p) => {
 				painterNote =
 					p.fraction < 1 ? `The painter is downloading: ${Math.round(p.fraction * 100)}%` : '';
 			})
@@ -88,6 +78,8 @@
 					painterNote = '';
 					stepChoices = p.stepChoices;
 					hasPainter = true;
+					// the labs' shared painting uses the same painter: it stops while Threads paints
+					releasePainting();
 					if (alive) study?.attachPainter(p);
 				})
 				.catch(

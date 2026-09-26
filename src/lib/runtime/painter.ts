@@ -165,6 +165,22 @@ fn row_project(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) l
   }
 }
 
+// The attention of a block at a glance: mean over heads, pooled b x b (each pooled row still sums to 1).
+// a=joint length, b=pool, c=probabilities [heads][a][a], d=out [a/b][a/b], e=heads
+@compute @workgroup_size(8, 8)
+fn attn_pool(@builtin(global_invocation_id) g: vec3u) {
+  let n = U.a / U.b;
+  if (g.x >= n || g.y >= n) { return; }
+  var s = 0.0;
+  for (var hh = 0u; hh < U.e; hh++) {
+    for (var y = 0u; y < U.b; y++) {
+      let base = U.c + (hh * U.a + g.y * U.b + y) * U.a + g.x * U.b;
+      for (var x = 0u; x < U.b; x++) { s += A[base + x]; }
+    }
+  }
+  A[U.d + g.y * n + g.x] = s / f32(U.e * U.b);
+}
+
 // Euler step: lat += fa * vel.  a=count, b=lat, c=vel
 @compute @workgroup_size(256)
 fn euler(@builtin(global_invocation_id) g: vec3u) {
@@ -235,10 +251,113 @@ type Kernel =
 	| 'lens_x0'
 	| 'attn_words'
 	| 'row_mean'
-	| 'row_project';
+	| 'row_project'
+	| 'attn_pool';
 type Op =
 	| { k: 'kernel'; name: Kernel; p: number[]; f?: number[]; wg: [number, number, number] }
-	| { k: 'gemm'; job: GemmJob };
+	| { k: 'gemm'; job: GemmJob }
+	| { k: 'copy'; from: number; to: GPUBuffer; at: number; count: number }; // arena floats -> buffer floats
+
+/** Where the numbers of one row live in a stream at a tap point: the region, its row width, its first row. */
+type Tap = (
+	ops: Op[],
+	name: string,
+	region: number,
+	width: number,
+	rowBase: number,
+	rows: 'txt' | 'img' | 'all',
+	block: number
+) => void;
+
+const POOL = 8; // the pooled attention map: 1536 / 8 = 192 on a side
+
+/**
+ * What a painting keeps for the labs, filled in while it paints: for the rows followed (the prompt's words and some
+ * image patches, by joint index: text 0..511, image 512..1535), every step and block, the input of every matrix
+ * ('light'); for a few rows, everything the block computes ('full'); per block, the attention pooled to 192 x 192.
+ *   double block: n1 (q, k, v input), o (output projection input), n2 (MLP input), cat (MLP output input);
+ *                 full: h_in, q, k, v (raw), qr, kr (normed and turned), h_mid, p (MLP gate | up), h_out, attn
+ *   single block: n1 (fused input), cat (output input: attention | MLP); full: h_in, p (q | k | v | gate | up), qr,
+ *                 kr, h_out, attn
+ *   attn: the row's attention over all 1536 rows, per head [24][1536]
+ *   per step (block -1): lat (the patch's latent, before the step); (block 25): nout (input of the output
+ *   projection), vel (the patch's velocity)
+ *   per word (step -1, block -1): taps (the reader's layers 7 | 14 | 21), ctx (the adapter's output)
+ */
+export class PainterCapture {
+	readonly buffer: GPUBuffer;
+	readonly size: number;
+	private map = new Map<string, number>();
+
+	constructor(
+		device: GPUDevice,
+		readonly steps: number,
+		readonly words: number[],
+		readonly patches: number[],
+		readonly full: number[],
+		/** The steps at which the full rows keep everything (the others keep what every row keeps). */
+		readonly fullSteps: number[] = Array.from({ length: steps }, (_, i) => i)
+	) {
+		let o = 0;
+		const put = (s: number, b: number, r: number, name: string, n: number) => {
+			this.map.set(`${s}|${b}|${r}|${name}`, o);
+			o += n;
+		};
+		const rows = [...words, ...patches];
+		for (const r of words) {
+			put(-1, -1, r, 'taps', TAP);
+			put(-1, -1, r, 'ctx', CTX);
+		}
+		for (let s = 0; s < steps; s++) {
+			for (let b = 0; b < 25; b++) put(s, b, -1, 'pool', (NJ / POOL) ** 2);
+			for (const r of rows) {
+				const isFull = full.includes(r) && fullSteps.includes(s);
+				if (r >= NT) put(s, -1, r, 'lat', CIN);
+				for (let b = 0; b < 25; b++) {
+					const dbl = b < 5;
+					put(s, b, r, 'n1', D);
+					put(s, b, r, 'cat', dbl ? MLP : D + MLP);
+					if (dbl) {
+						put(s, b, r, 'o', D);
+						put(s, b, r, 'n2', D);
+					}
+					if (!isFull) continue;
+					put(s, b, r, 'h_in', D);
+					put(s, b, r, 'h_out', D);
+					put(s, b, r, 'qr', D);
+					put(s, b, r, 'kr', D);
+					put(s, b, r, 'attn', H * NJ);
+					if (dbl) {
+						put(s, b, r, 'q', D);
+						put(s, b, r, 'k', D);
+						put(s, b, r, 'v', D);
+						put(s, b, r, 'h_mid', D);
+						put(s, b, r, 'p', 2 * MLP);
+					} else put(s, b, r, 'p', 3 * D + 2 * MLP);
+				}
+				if (r >= NT) {
+					put(s, 25, r, 'nout', D);
+					put(s, 25, r, 'vel', CIN);
+				}
+			}
+		}
+		this.size = o;
+		this.buffer = device.createBuffer({
+			label: 'painter capture',
+			size: Math.max(16, o * 4),
+			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+		});
+	}
+
+	/** Where a vector is kept (floats into buffer), or undefined if it is not. */
+	at(step: number, block: number, row: number, name: string): number | undefined {
+		return this.map.get(`${step}|${block}|${row}|${name}`);
+	}
+
+	destroy() {
+		this.buffer.destroy();
+	}
+}
 
 export interface PainterProgress {
 	stage: string;
@@ -265,6 +384,8 @@ export class Painter {
 	private textRows = 4;
 	readonly arena: GPUBuffer;
 	private dense: GPUBuffer;
+	private codesBuf: GPUBuffer;
+	private scalesBuf: GPUBuffer;
 	private gemm: TernaryGemm;
 	private pipes: Record<Kernel, GPUComputePipeline>;
 	private bind: GPUBindGroup;
@@ -292,6 +413,8 @@ export class Painter {
 	) {
 		this.manifest = files.manifest;
 		this.dense = dense;
+		this.codesBuf = codes;
+		this.scalesBuf = scales;
 		this.tern = tern;
 		this.denseAt = denseAt;
 		this.sigmas = (files.manifest.schedule as { sigmas: number[] }).sigmas;
@@ -319,7 +442,8 @@ export class Painter {
 			['aw', NI * 128],
 			['awt', 128 * 128], // the prompt's words reading each other (joint attention, text rows)
 			['mu', 2 * D], // the mean image row and mean text row after a block
-			['proj', NJ * 4] // each row's projection on the drawing space (image rows, then text rows)
+			['proj', NJ * 4], // each row's projection on the drawing space (image rows, then text rows)
+			['pool', (NJ / POOL) ** 2] // a block's attention pooled (see attn_pool)
 		];
 		const at: Record<string, number> = {};
 		for (const [name, n] of regions) {
@@ -371,7 +495,8 @@ export class Painter {
 			'lens_x0',
 			'attn_words',
 			'row_mean',
-			'row_project'
+			'row_project',
+			'attn_pool'
 		];
 		this.pipes = Object.fromEntries(
 			names.map((e) => [
@@ -415,7 +540,8 @@ export class Painter {
 			nc += e.codes.bytes / 4;
 			ns += e.scales.bytes / 4;
 		}
-		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+		// (copyable, so a lab can read back one weight exactly)
+		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
 		const codes = device.createBuffer({ label: 'painter codes', size: nc * 4, usage });
 		const scales = device.createBuffer({ label: 'painter scales', size: ns * 4, usage });
 		// dense weights the DiT reads: embedders, projection out, QK gains, rope tables
@@ -597,7 +723,7 @@ export class Painter {
 	}
 
 	/** The ops of one step and where its blocks end: [op index after which, block] (-1 embedded, 25 done). */
-	private stepOps(s: number) {
+	private stepOps(s: number, tap?: Tap, pool?: (b: number, ops: Op[]) => void) {
 		const at = this.at,
 			mod = at.mod + s * 17 * D;
 		const MI = (r: number) => mod + r * D,
@@ -649,6 +775,15 @@ export class Painter {
 		};
 
 		const hooks: [number, number][] = []; // [op index after which, block] (-1 = embedded, 25 = step done)
+		const T = (
+			name: string,
+			region: number,
+			width: number,
+			rowBase: number,
+			rows: 'txt' | 'img' | 'all',
+			b: number
+		) => tap?.(ops, name, region, width, rowBase, rows, b);
+		T('lat', at.lat, CIN, NT, 'img', -1);
 		// embed: image tokens from the latent, text tokens from the conditioning
 		{
 			K(
@@ -667,52 +802,81 @@ export class Painter {
 		hooks.push([ops.length, -1]);
 		for (let b = 0; b < 5; b++) {
 			const P = `transformer_blocks.${b}.`;
+			T('h_in', at.h, D, 0, 'all', b);
 			modulate(NT, at.h + T0, at.n1 + T0, MT(0), MT(1));
 			modulate(NI, at.h + I0, at.n1 + I0, MI(0), MI(1));
+			T('n1', at.n1, D, 0, 'all', b);
 			G(P + 'attn.add_q_proj.weight', NT, at.n1 + T0, at.q + T0);
 			G(P + 'attn.add_k_proj.weight', NT, at.n1 + T0, at.k + T0);
 			G(P + 'attn.add_v_proj.weight', NT, at.n1 + T0, at.v + T0);
 			G(P + 'attn.to_q.weight', NI, at.n1 + I0, at.q + I0);
 			G(P + 'attn.to_k.weight', NI, at.n1 + I0, at.k + I0);
 			G(P + 'attn.to_v.weight', NI, at.n1 + I0, at.v + I0);
+			T('q', at.q, D, 0, 'all', b);
+			T('k', at.k, D, 0, 'all', b);
+			T('v', at.v, D, 0, 'all', b);
 			qk(NT, at.q + T0, D, at.q + T0, P + 'attn.norm_added_q.weight', 0);
 			qk(NI, at.q + I0, D, at.q + I0, P + 'attn.norm_q.weight', NT);
 			qk(NT, at.k + T0, D, at.k + T0, P + 'attn.norm_added_k.weight', 0);
 			qk(NI, at.k + I0, D, at.k + I0, P + 'attn.norm_k.weight', NT);
+			T('qr', at.q, D, 0, 'all', b);
+			T('kr', at.k, D, 0, 'all', b);
 			attention(at.v, D, at.o, D);
+			T('attn', at.s, NJ, 0, 'all', b);
+			pool?.(b, ops);
+			T('o', at.o, D, 0, 'all', b);
 			G(P + 'attn.to_out.0.weight', NI, at.o + I0, at.h + I0, { bias: MI(2), gated: true });
 			G(P + 'attn.to_add_out.weight', NT, at.o + T0, at.h + T0, { bias: MT(2), gated: true });
+			T('h_mid', at.h, D, 0, 'all', b);
 			modulate(NI, at.h + I0, at.n1 + I0, MI(3), MI(4));
 			modulate(NT, at.h + T0, at.n1 + T0, MT(3), MT(4));
+			T('n2', at.n1, D, 0, 'all', b);
 			G(P + 'ff.linear_in.weight', NI, at.n1 + I0, at.p);
+			T('p', at.p, 2 * MLP, NT, 'img', b);
 			K('swiglu', [NI, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, NI, 1]);
+			T('cat', at.cat, MLP, NT, 'img', b);
 			G(P + 'ff.linear_out.weight', NI, at.cat, at.h + I0, { bias: MI(5), gated: true });
 			G(P + 'ff_context.linear_in.weight', NT, at.n1 + T0, at.p);
+			T('p', at.p, 2 * MLP, 0, 'txt', b);
 			K('swiglu', [NT, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, NT, 1]);
+			T('cat', at.cat, MLP, 0, 'txt', b);
 			G(P + 'ff_context.linear_out.weight', NT, at.cat, at.h + T0, { bias: MT(5), gated: true });
+			T('h_out', at.h, D, 0, 'all', b);
 			hooks.push([ops.length, b]);
 		}
 		const PW = 3 * D + 2 * MLP,
 			CW = D + MLP;
 		for (let b = 0; b < 20; b++) {
 			const P = `single_transformer_blocks.${b}.`;
+			const bb = 5 + b;
+			T('h_in', at.h, D, 0, 'all', bb);
 			modulate(NJ, at.h, at.n1, MS(0), MS(1));
+			T('n1', at.n1, D, 0, 'all', bb);
 			G(P + 'attn.to_qkv_mlp_proj.weight', NJ, at.n1, at.p);
+			T('p', at.p, PW, 0, 'all', bb);
 			qk(NJ, at.p, PW, at.q, P + 'attn.norm_q.weight', 0);
 			qk(NJ, at.p + D, PW, at.k, P + 'attn.norm_k.weight', 0);
+			T('qr', at.q, D, 0, 'all', bb);
+			T('kr', at.k, D, 0, 'all', bb);
 			attention(at.p + 2 * D, PW, at.cat, CW);
+			T('attn', at.s, NJ, 0, 'all', bb);
+			pool?.(bb, ops);
 			K('swiglu', [NJ, MLP, at.p + 3 * D, PW, at.cat + D, CW], [MLP / 256, NJ, 1]);
+			T('cat', at.cat, CW, 0, 'all', bb);
 			G(P + 'attn.to_out.weight', NJ, at.cat, at.h, { bias: MS(2), gated: true });
-			hooks.push([ops.length, 5 + b]);
+			T('h_out', at.h, D, 0, 'all', bb);
+			hooks.push([ops.length, bb]);
 		}
 		// velocity and the Euler update
 		modulate(NI, at.h + I0, at.n1 + I0, MO(1), MO(0));
+		T('nout', at.n1, D, 0, 'img', 25);
 		K(
 			'dgemm',
 			[NI, CIN, D, at.n1 + I0, D, 0, this.w('proj_out.weight'), D, 0, at.vel, CIN, 0, 1],
 			[CIN / 64, NI / 64, 1],
 			[1]
 		);
+		T('vel', at.vel, CIN, NT, 'img', 25);
 		K(
 			'euler',
 			[NI * CIN, at.lat, at.vel],
@@ -727,6 +891,7 @@ export class Painter {
 	// ---- scheduled work: the same computation cut into slices of a few milliseconds
 
 	private cost(o: Op): number {
+		if (o.k === 'copy') return 0.002;
 		if (o.k === 'gemm') return gemmMs(o.job.M, o.job.N, o.job.K);
 		const p = o.p;
 		switch (o.name) {
@@ -748,7 +913,7 @@ export class Painter {
 	/** Cut an op into row slices that each cost at most `budget` ms (rows in multiples of 64 where it matters). */
 	private slice(o: Op, budget: number): Op[] {
 		const c = this.cost(o);
-		if (c <= budget) return [o];
+		if (c <= budget || o.k === 'copy') return [o];
 		const rows = o.k === 'gemm' ? o.job.M : o.p[0];
 		let R = Math.max(64, Math.floor((rows * budget) / c / 64) * 64);
 		if (o.k === 'kernel' && (o.name === 'softmax' || o.name === 'modulate' || o.name === 'swiglu'))
@@ -1053,6 +1218,211 @@ export class Painter {
 		};
 	}
 
+	/**
+	 * A whole painting that keeps what `cap` asks for (see PainterCapture), as tasks (after encodeTasks). After every
+	 * block its quick picture is made in taef2.earlyTexture (onPicture is called while that is recorded, to copy it)
+	 * and onBlock(s, b) runs once it is done; onStep(s) after each step; the finished picture lands in taef2.texture,
+	 * then onDone.
+	 */
+	captureTasks(
+		cap: PainterCapture,
+		opts: {
+			budget?: number;
+			onPicture?: (enc: GPUCommandEncoder, s: number, b: number) => void;
+			onBlock?: (s: number, b: number) => void;
+			onStep?: (s: number) => void;
+			onDone?: () => void;
+		} = {}
+	): GpuTask[] {
+		const at = this.at,
+			budget = opts.budget ?? 9;
+		const rows = [...cap.words, ...cap.patches];
+		const tasks: GpuTask[] = [];
+		// the words as the adapter takes them, and as it gives them
+		const first: Op[] = [];
+		for (const r of cap.words) {
+			const t = cap.at(-1, -1, r, 'taps'),
+				c = cap.at(-1, -1, r, 'ctx');
+			if (t !== undefined)
+				first.push({ k: 'copy', from: at.taps + r * TAP, to: cap.buffer, at: t, count: TAP });
+			if (c !== undefined)
+				first.push({ k: 'copy', from: at.ctx + r * CTX, to: cap.buffer, at: c, count: CTX });
+		}
+		tasks.push(...this.tasks(first, budget));
+		for (let s = 0; s < this.steps; s++) {
+			const tap: Tap = (ops, name, region, width, rowBase, which, b) => {
+				for (const r of rows) {
+					if (which === 'txt' && r >= NT) continue;
+					if (which === 'img' && r < NT) continue;
+					const dst = cap.at(s, b, r, name);
+					if (dst === undefined) continue;
+					if (name === 'attn') {
+						for (let h = 0; h < H; h++)
+							ops.push({
+								k: 'copy',
+								from: at.s + (h * NJ + r) * NJ,
+								to: cap.buffer,
+								at: dst + h * NJ,
+								count: NJ
+							});
+					} else
+						ops.push({
+							k: 'copy',
+							from: region + (r - rowBase) * width,
+							to: cap.buffer,
+							at: dst,
+							count: width
+						});
+				}
+			};
+			const pool = (b: number, ops: Op[]) => {
+				const dst = cap.at(s, b, -1, 'pool');
+				if (dst === undefined) return;
+				const n = NJ / POOL;
+				ops.push({
+					k: 'kernel',
+					name: 'attn_pool',
+					p: [NJ, POOL, at.s, at.pool, H],
+					wg: [n / 8, n / 8, 1]
+				});
+				ops.push({ k: 'copy', from: at.pool, to: cap.buffer, at: dst, count: n * n });
+			};
+			const { ops, hooks } = this.stepOps(s, tap, pool);
+			let from = 0;
+			for (const [to, b] of hooks) {
+				tasks.push(...this.tasks(ops.slice(from, to), budget));
+				from = to;
+				if (b >= 0 && b < 25) tasks.push(this.pictureTask(s, b, opts.onPicture, opts.onBlock));
+				if (b === 25 && opts.onStep)
+					tasks.push({ cost: 0, record: () => {}, done: () => opts.onStep!(s) });
+			}
+		}
+		tasks.push(...this.finalTasks(() => opts.onDone?.(), budget));
+		return tasks;
+	}
+
+	/** The painting block b of step s has in mind, in taef2.earlyTexture (the tuned lens, then the decoder's first stage). */
+	private pictureTask(
+		s: number,
+		b: number,
+		onPicture?: (enc: GPUCommandEncoder, s: number, b: number) => void,
+		onBlock?: (s: number, b: number) => void
+	): GpuTask {
+		const at = this.at;
+		const lens = this.hasLens && this.taef2.hasEarly;
+		const ops: Op[] = [];
+		if (lens) {
+			const L = this.w('viz.lens') + b * 3073 * CIN;
+			ops.push({
+				k: 'kernel',
+				name: 'dgemm',
+				p: [NI, CIN, D, at.h + NT * D, D, 0, L, CIN, 0, at.vl, CIN, 0, 3],
+				f: [1],
+				wg: [CIN / 64, NI / 64, 1]
+			});
+			ops.push({
+				k: 'kernel',
+				name: 'lens_x0',
+				p: [NI * CIN, at.vl, L + 3072 * CIN, at.lat, at.x0],
+				f: [this.sigmas[s]],
+				wg: [(NI * CIN) / 256, 1, 1]
+			});
+		}
+		return {
+			cost: 2,
+			record: (enc, sub) => {
+				if (!lens) return;
+				this.record(ops, enc, sub);
+				this.taef2.copyLatent(enc, this.arena, at.x0);
+				this.taef2.decodeEarly(enc);
+				onPicture?.(enc, s, b);
+			},
+			done: onBlock ? () => onBlock(s, b) : undefined
+		};
+	}
+
+	/** The painter's weights (for drawing them): the ternary codes and scales, the dense weights, and where each is. */
+	get weights() {
+		return {
+			codes: this.codesBuf,
+			scales: this.scalesBuf,
+			dense: this.dense,
+			ternary: (name: string) => this.t(name),
+			dense_at: (name: string) => this.w(name),
+			names: [...this.tern.keys()]
+		};
+	}
+
+	/** One of the painter's ternary weights exactly: its code (-1, 0, +1) and its group's scale. */
+	async weight(name: string, row: number, col: number): Promise<{ code: number; scale: number }> {
+		const t = this.t(name);
+		const dev = this.device;
+		const buf = dev.createBuffer({
+			size: 8,
+			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+		});
+		const enc = dev.createCommandEncoder();
+		enc.copyBufferToBuffer(
+			this.codesBuf,
+			(t.codes + row * (t.cols / 16) + Math.floor(col / 16)) * 4,
+			buf,
+			0,
+			4
+		);
+		enc.copyBufferToBuffer(
+			this.scalesBuf,
+			(t.scales + row * (t.cols / 128) + Math.floor(col / 128)) * 4,
+			buf,
+			4,
+			4
+		);
+		dev.queue.submit([enc.finish()]);
+		await buf.mapAsync(GPUMapMode.READ);
+		const u = new Uint32Array(buf.getMappedRange().slice(0));
+		buf.destroy();
+		return { code: ((u[0] >>> ((col % 16) * 2)) & 3) - 1, scale: new Float32Array(u.buffer)[1] };
+	}
+
+	/** Floats read back from the painter's activations (its arena), its dense weights or its ternary scales. */
+	async readFloats(
+		from: 'arena' | 'dense' | 'scales',
+		offset: number,
+		count: number
+	): Promise<Float32Array> {
+		const dev = this.device;
+		const buf = dev.createBuffer({
+			size: count * 4,
+			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+		});
+		const enc = dev.createCommandEncoder();
+		const src = from === 'arena' ? this.arena : from === 'dense' ? this.dense : this.scalesBuf;
+		enc.copyBufferToBuffer(src, offset * 4, buf, 0, count * 4);
+		dev.queue.submit([enc.finish()]);
+		await buf.mapAsync(GPUMapMode.READ);
+		const v = new Float32Array(buf.getMappedRange().slice(0));
+		buf.destroy();
+		return v;
+	}
+
+	/** A dense weight exactly. */
+	async denseWeight(name: string, index: number): Promise<number> {
+		const dev = this.device;
+		const buf = dev.createBuffer({
+			size: 4,
+			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+		});
+		const enc = dev.createCommandEncoder();
+		enc.copyBufferToBuffer(this.dense, (this.w(name) + index) * 4, buf, 0, 4);
+		dev.queue.submit([enc.finish()]);
+		await buf.mapAsync(GPUMapMode.READ);
+		const v = new Float32Array(buf.getMappedRange().slice(0))[0];
+		buf.destroy();
+		return v;
+	}
+
+	/** Shapes and positions (for the labs). */
+	static readonly dims = { D, H, HD, MLP, NT, NI, NJ, CIN, CTX, TAP, POOL };
+
 	/** The finished picture as tasks: the final latent through TAEF2 into taef2.texture, then onDone. */
 	finalTasks(onDone: () => void, budget = 9): GpuTask[] {
 		const at = this.at;
@@ -1102,7 +1472,7 @@ export class Painter {
 		}
 		const k0 = this.slotAt,
 			g0 = this.gemmAt;
-		const kernels = ops.filter((o) => o.k === 'kernel');
+		const kernels = ops.filter((o): o is Extract<Op, { k: 'kernel' }> => o.k === 'kernel');
 		const data = new ArrayBuffer(Math.max(1, kernels.length) * 256);
 		kernels.forEach((o, i) => {
 			new Uint32Array(data, i * 256, 16).set(o.p.map((x) => x >>> 0));
@@ -1115,17 +1485,24 @@ export class Painter {
 		if (jobs.length) this.gemm.prepare(jobs, g0);
 		this.slotAt += kernels.length;
 		this.gemmAt += jobs.length;
-		const pass = enc.beginComputePass();
+		let pass: GPUComputePassEncoder | null = null;
 		let ki = k0,
 			gi = g0;
 		for (const o of ops) {
+			if (o.k === 'copy') {
+				pass?.end();
+				pass = null;
+				enc.copyBufferToBuffer(this.arena, o.from * 4, o.to, o.at * 4, o.count * 4);
+				continue;
+			}
+			pass ??= enc.beginComputePass();
 			if (o.k === 'kernel') {
 				pass.setPipeline(this.pipes[o.name]);
 				pass.setBindGroup(0, this.bind, [ki++ * 256]);
 				pass.dispatchWorkgroups(...o.wg);
 			} else this.gemm.dispatch(pass, gi++, o.job);
 		}
-		pass.end();
+		pass?.end();
 	}
 
 	/** Step counts this painter can run (4 always; others when schedules.json is present). */

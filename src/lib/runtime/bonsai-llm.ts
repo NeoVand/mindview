@@ -50,6 +50,8 @@ export interface ArenaLayout {
 	logits: number; // [vocab]                        next-token logits for the last position
 	// per layer ([layers][MAX_TOKENS][width]) so any layer's computation can be shown after the pass
 	xn: number; // attention input after RMSNorm
+	qraw: number; // queries straight out of the q projection (before q-norm and rotary)
+	kraw: number; // keys straight out of the k projection
 	q: number; // queries after q-norm and rotary
 	k: number; // keys after k-norm and rotary
 	v: number;
@@ -289,6 +291,7 @@ export class BonsaiLLM {
 	private codes: GPUBuffer;
 	private scales: GPUBuffer;
 	private normw: GPUBuffer;
+	private normCpu: Float32Array;
 	private tokBuf: GPUBuffer;
 	private invBuf: GPUBuffer;
 	private params: GPUBuffer;
@@ -366,16 +369,18 @@ export class BonsaiLLM {
 			} else throw new Error(`Tensor ${t.name} has unsupported type ${t.type}.`);
 		}
 		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+		// the weights can be copied back (to show a single weight exactly when it is pointed at)
+		const weightUsage = usage | GPUBufferUsage.COPY_SRC;
 		this.codes = device.createBuffer({
 			label: 'ternary codes',
 			size: codeWords * 4,
-			usage,
+			usage: weightUsage,
 			mappedAtCreation: true
 		});
 		this.scales = device.createBuffer({
 			label: 'group scales',
 			size: scaleCount * 4,
-			usage,
+			usage: weightUsage,
 			mappedAtCreation: true
 		});
 		this.normw = device.createBuffer({
@@ -410,6 +415,7 @@ export class BonsaiLLM {
 			}
 			info.meanScale = sum / blocks;
 		}
+		this.normCpu = normF.slice();
 		this.codes.unmap();
 		this.scales.unmap();
 		this.normw.unmap();
@@ -431,6 +437,8 @@ export class BonsaiLLM {
 			final: take(N * D),
 			logits: take(c.vocab),
 			xn: take(L * N * D),
+			qraw: take(L * N * H * c.headDim),
+			kraw: take(L * N * KV),
 			q: take(L * N * H * c.headDim),
 			k: take(L * N * KV),
 			v: take(L * N * KV),
@@ -515,6 +523,54 @@ export class BonsaiLLM {
 		return this.t(name);
 	}
 
+	/** The names of every ternary tensor. */
+	get tensorNames(): string[] {
+		return [...this.tensors.keys()];
+	}
+
+	/** A norm's gain vector (a copy). */
+	normWeight(name: string): Float32Array {
+		const at = this.norms.get(name);
+		if (at === undefined) throw new Error(`Missing norm ${name}`);
+		const n =
+			name.includes('q_norm') || name.includes('k_norm') ? this.config.headDim : this.config.dim;
+		return this.normCpu.slice(at, at + n);
+	}
+
+	/**
+	 * One weight exactly as the model holds it: its code (-1, 0 or +1) and its group's scale (one per 128 weights
+	 * of a row). row is the output, col the input.
+	 */
+	async weight(name: string, row: number, col: number): Promise<{ code: number; scale: number }> {
+		const t = this.t(name);
+		const dev = this.device;
+		const buf = dev.createBuffer({
+			size: 8,
+			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+		});
+		const enc = dev.createCommandEncoder();
+		enc.copyBufferToBuffer(
+			this.codes,
+			(t.codes + row * (t.cols / 16) + Math.floor(col / 16)) * 4,
+			buf,
+			0,
+			4
+		);
+		enc.copyBufferToBuffer(
+			this.scales,
+			(t.scales + row * (t.cols / 128) + Math.floor(col / 128)) * 4,
+			buf,
+			4,
+			4
+		);
+		dev.queue.submit([enc.finish()]);
+		await buf.mapAsync(GPUMapMode.READ);
+		const u = new Uint32Array(buf.getMappedRange().slice(0));
+		buf.destroy();
+		const code = ((u[0] >>> ((col % 16) * 2)) & 3) - 1;
+		return { code, scale: new Float32Array(u.buffer)[1] };
+	}
+
 	private t(name: string): Ternary {
 		const t = this.tensors.get(name);
 		if (!t) throw new Error(`Missing tensor ${name}`);
@@ -578,11 +634,13 @@ export class BonsaiLLM {
 				up = L.up + l * N * F;
 			const b = `blk.${l}.`;
 			norm(n, D, resid, xn, b + 'attn_norm.weight');
-			mm(this.t(b + 'attn_q.weight'), xn, q, n);
-			mm(this.t(b + 'attn_k.weight'), xn, k, n);
+			const qraw = L.qraw + l * N * H * HD,
+				kraw = L.kraw + l * N * KVH * HD;
+			mm(this.t(b + 'attn_q.weight'), xn, qraw, n);
+			mm(this.t(b + 'attn_k.weight'), xn, kraw, n);
 			mm(this.t(b + 'attn_v.weight'), xn, v, n);
-			norm(n * H, HD, q, q, b + 'attn_q_norm.weight');
-			norm(n * KVH, HD, k, k, b + 'attn_k_norm.weight');
+			norm(n * H, HD, qraw, q, b + 'attn_q_norm.weight');
+			norm(n * KVH, HD, kraw, k, b + 'attn_k_norm.weight');
 			push(
 				this.pipes.rope,
 				[n, H, KVH, q, k, 0, 0, 0, 0, 0, 0, 0, this.attentionScaling],
