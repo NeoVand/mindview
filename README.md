@@ -58,7 +58,7 @@ no network), put them in `static/models` and they are used instead:
 hf download prism-ml/Ternary-Bonsai-1.7B-gguf Ternary-Bonsai-1.7B-Q2_0.gguf --local-dir /tmp/reader
 mkdir -p static/models/ternary-bonsai-1.7b
 mv /tmp/reader/Ternary-Bonsai-1.7B-Q2_0.gguf static/models/ternary-bonsai-1.7b/model.gguf
-hf download NeoVand/mindview-painter --local-dir static/models/bonsai-image-4b
+hf download mohsenvand/mindview-painter --local-dir static/models/bonsai-image-4b
 ```
 
 `MODELS=hub` or `MODELS=local` forces one or the other (see `vite.config.ts` and `src/lib/models.ts`).
@@ -98,5 +98,5 @@ Other commands:
 - [Black Forest Labs](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B): FLUX.2 [klein] 4B, the painter's
   architecture (Apache 2.0).
 - [Ollin Boer Bohan](https://huggingface.co/madebyollin/taef2): TAEF2 (MIT).
-- The painter bundle on Hugging Face ([NeoVand/mindview-painter](https://huggingface.co/NeoVand/mindview-painter))
+- The painter bundle on Hugging Face ([mohsenvand/mindview-painter](https://huggingface.co/mohsenvand/mindview-painter))
   repackages those weights for the browser, together with the adapter and the lens trained here.

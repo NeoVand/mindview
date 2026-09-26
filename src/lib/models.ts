@@ -10,7 +10,7 @@ declare const __LOCAL_MODELS__: boolean;
 
 const READER_HUB =
 	'https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/983b5dec2ff16aab79990711ba0f828a499a7e6a/Ternary-Bonsai-1.7B-Q2_0.gguf';
-const PAINTER_HUB = 'https://huggingface.co/NeoVand/mindview-painter/resolve/main';
+const PAINTER_HUB = 'https://huggingface.co/mohsenvand/mindview-painter/resolve/main';
 
 /** The reader's GGUF file. */
 export function readerUrl(): string {
