@@ -60,6 +60,7 @@
 				if (machine.prediction !== prediction) prediction = machine.prediction;
 				const r = machine.playing;
 				if (r !== revealing) revealing = r;
+				if (machine.step + 1 !== step) step = machine.step + 1;
 				const ps = machine.paintStatus;
 				if (ps?.text !== paint?.text || ps?.fraction !== paint?.fraction) paint = ps;
 			};

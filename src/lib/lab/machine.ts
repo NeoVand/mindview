@@ -116,8 +116,9 @@ export class Machine implements Scene {
 	private painter?: Painter;
 	private planes: ImagePlanes;
 	private run: PaintingRun | null = null;
-	/** The painting step shown (0-based). */
+	/** The painting step shown (0-based): while it paints, the one being painted, unless one is chosen. */
 	step = 3;
+	private stepChosen = false;
 	/** The patch followed (0..1023), or null to follow the chosen word. */
 	patch: number | null = null;
 	private stateOf = new Map<number, string>();
@@ -168,6 +169,8 @@ export class Machine implements Scene {
 	/** A (new) painting to light the painter's part with. */
 	setRun(run: PaintingRun) {
 		this.run = run;
+		this.stepChosen = false;
+		this.step = run.done ? run.steps - 1 : run.at.step;
 		this.panels.setCapture(run.cap.buffer);
 		this.wall?.forgetPictures();
 		this.stateOf.clear();
@@ -195,6 +198,7 @@ export class Machine implements Scene {
 
 	setStep(s: number) {
 		this.step = s;
+		this.stepChosen = true;
 		this.refreshKey = '';
 	}
 
@@ -936,9 +940,11 @@ export class Machine implements Scene {
 		// the painter: relight as it paints (and when the row, step or mode change)
 		if (this.wall) {
 			const run = this.run;
+			if (run && !this.stepChosen) this.step = run.done ? run.steps - 1 : run.at.step;
 			const key = JSON.stringify([
 				run?.at,
 				run?.encoded,
+				run?.wordsKept,
 				run?.done,
 				this.row,
 				this.step,

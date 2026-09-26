@@ -325,7 +325,7 @@ export class PainterWall {
 				? run.has(step, Math.min(24, block))
 				: input === 'lat'
 					? run.has(step, 0)
-					: run.has(0, 0));
+					: run.wordsKept);
 		for (const m of this.mats) {
 			const off = uses(m.stream) && work ? offsetOf(m.block, m.input) : undefined;
 			const ready = off !== undefined && reached(m.block, m.input);

@@ -1232,6 +1232,8 @@ export class Painter {
 			onBlock?: (s: number, b: number) => void;
 			onStep?: (s: number) => void;
 			onDone?: () => void;
+			/** The words' inputs to the adapter and the embedder are kept. */
+			onWords?: () => void;
 		} = {}
 	): GpuTask[] {
 		const at = this.at,
@@ -1249,6 +1251,7 @@ export class Painter {
 				first.push({ k: 'copy', from: at.ctx + r * CTX, to: cap.buffer, at: c, count: CTX });
 		}
 		tasks.push(...this.tasks(first, budget));
+		if (opts.onWords) tasks.push({ cost: 0, record: () => {}, done: opts.onWords });
 		for (let s = 0; s < this.steps; s++) {
 			const tap: Tap = (ops, name, region, width, rowBase, which, b) => {
 				for (const r of rows) {

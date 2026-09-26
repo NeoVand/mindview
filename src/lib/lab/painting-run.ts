@@ -36,6 +36,8 @@ export class PaintingRun {
 	/** How far it has got: the last block done (step, block); block 25 = the step is done. */
 	at = { step: 0, block: -1 };
 	encoded = false;
+	/** The words' inputs to the adapter and the context embedder are kept. */
+	wordsKept = false;
 	done = false;
 	readonly steps: number;
 	/** The step at which the full rows keep everything. */
@@ -82,6 +84,9 @@ export class PaintingRun {
 					enc.copyTextureToTexture({ texture: src }, { texture: tex }, [src.width, src.height]);
 					this.textures.push(tex);
 					this.pictures[s][b] = tex;
+				},
+				onWords: () => {
+					if (!this.dead) this.wordsKept = true;
 				},
 				onBlock: (s, b) => {
 					if (!this.dead) this.at = { step: s, block: b };

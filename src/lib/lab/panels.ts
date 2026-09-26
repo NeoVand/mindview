@@ -306,7 +306,8 @@ fn shade(i: VO) -> vec4f {
   let mag = m.x / (P.gain * boost(bf));
   // a sign means something for one cell; mixed over many it does not: far away the light is neutral
   let hue = mix(hueOf(m), BONE * 0.9, smoothstep(0.8, 2.5, foot));
-  var col = hue * (1.0 - exp(-mag * 1.6)) + hue * max(0.0, mag - 1.0) * 0.25 * P.lift;
+  // above full brightness a cell glows, up to a point (a single huge value must not flood the view)
+  var col = hue * (1.0 - exp(-mag * 1.6)) + hue * min(max(0.0, mag - 1.0), 3.0) * 0.25 * P.lift;
   // before the sweep: done (full); after it: waiting (faint); at it: a bright edge
   if ((P.flags & SWEEP) != 0u) {
     let d = cell.x - P.sweep;
