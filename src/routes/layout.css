@@ -1,0 +1,21 @@
+@import 'tailwindcss';
+
+:root {
+	--void: #000000; /* the zero weight: no connection */
+	--glacier: #56c8ff; /* -1 */
+	--ember: #ffb04a; /* +1 */
+	--bone: #e8e2d6; /* type */
+	--ash: #7d848c;
+	--serif: 'Spectral', 'Noto Serif SC', 'Noto Serif JP', serif;
+	color-scheme: dark;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+	background: var(--void);
+	color: var(--bone);
+	font-family: var(--serif);
+	overflow: hidden;
+}

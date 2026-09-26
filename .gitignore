@@ -1,0 +1,39 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+# Playwright
+test-results
+
+# large model files for local dev (loaded from Hugging Face in production)
+/static/models/
+
+# research: local environment, data and renders (large), a duplicate of static/traces, and third-party material
+# (PrismML whitepapers, reference code) that is not ours to redistribute
+/research/.venv/
+/research/data/
+/research/renders/
+/research/traces/
+/research/papers/
+/research/reference/
+*.log
+__pycache__/

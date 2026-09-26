@@ -1,0 +1,1257 @@
+// Live WebGPU runtime for the painter: Bonsai Image 4B (FLUX.2 klein architecture, ternary DiT), fed by Ternary
+// Bonsai 1.7B through the ternary adapter, 4 flow-matching Euler steps at 512 x 512, decoded by TAEF2.
+// Follows research/PAINTER-SPEC.md and research/scripts/painter_reference.py op by op:
+//   text:  taps h7|h14|h21 of the 1.7B over 512 tokens -> adapter (ternary 6144 -> 7680, + bias; rows 0..2 fixed)
+//   DiT:   x = lat W_x^T, c = ctx W_ctx^T; 5 double blocks (text and image weights, joint attention), then 20 single
+//          blocks over the joint sequence (text first); velocity = (LN(h_img)(1 + scale) + shift) W_out^T
+//   step:  lat += (sigma_{s+1} - sigma_s) v
+// Everything is f32 on the GPU; ternary matrices use the tiled ternary GEMM, dense ones a strided batched GEMM.
+import type { BonsaiLLM } from './bonsai-llm';
+import { fetchModelFile, fetchModelJson } from './cache';
+import { halfToFloat } from './gguf';
+import { TernaryGemm, type GemmJob } from './gemm';
+import { PainterFiles } from './painter-files';
+import { gemmMs, type GpuTask } from './scheduler';
+import { Taef2 } from './taef2';
+
+const D = 3072,
+	H = 24,
+	HD = 128,
+	MLP = 9216,
+	NT = 512, // text tokens
+	NI = 1024, // image tokens
+	NJ = NT + NI,
+	CIN = 128,
+	CTX = 7680,
+	TAP = 6144;
+
+const WGSL = /* wgsl */ `
+struct P { a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32, i: u32, j: u32, k: u32, l: u32, m: u32, n: u32, o: u32, p: u32, fa: f32, fb: f32, fc: f32, fd: f32 };
+@group(0) @binding(0) var<uniform> U: P;
+@group(0) @binding(1) var<storage, read> WD: array<f32>;
+@group(0) @binding(2) var<storage, read_write> A: array<f32>;
+
+var<workgroup> red: array<f32, 512>;
+
+// LayerNorm (no affine, eps fa) then modulation: y = LN(x) * (1 + scale) + shift
+// a=rows, b=width, c=x, d=y, e=shift, f=scale, g=x row stride, h=y row stride
+@compute @workgroup_size(256)
+fn modulate(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) li: vec3u) {
+  let r = wg.x; let i = li.x;
+  let xb = U.c + r * U.g;
+  var s = 0.0;
+  for (var k = i; k < U.b; k += 256u) { s += A[xb + k]; }
+  red[i] = s;
+  workgroupBarrier();
+  for (var st = 128u; st > 0u; st >>= 1u) { if (i < st) { red[i] += red[i + st]; } workgroupBarrier(); }
+  let mean = red[0] / f32(U.b);
+  workgroupBarrier();
+  var v = 0.0;
+  for (var k = i; k < U.b; k += 256u) { let d = A[xb + k] - mean; v += d * d; }
+  red[i] = v;
+  workgroupBarrier();
+  for (var st = 128u; st > 0u; st >>= 1u) { if (i < st) { red[i] += red[i + st]; } workgroupBarrier(); }
+  let inv = inverseSqrt(red[0] / f32(U.b) + U.fa);
+  let yb = U.d + r * U.h;
+  for (var k = i; k < U.b; k += 256u) {
+    A[yb + k] = (A[xb + k] - mean) * inv * (1.0 + A[U.f + k]) + A[U.e + k];
+  }
+}
+
+// per-head RMSNorm (learned gain, eps fa) then rotary embedding on interleaved pairs (2p, 2p+1)
+// a=tokens, b=src, c=src stride, d=dst, e=dst stride, f=gain (WD), g=cos (WD) [tokens][64], h=sin (WD), i=first rope row
+@compute @workgroup_size(64)
+fn qknorm_rope(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) li: vec3u) {
+  let t = wg.x; let hh = wg.y; let p = li.x;
+  let sb = U.b + t * U.c + hh * 128u + 2u * p;
+  let x0 = A[sb]; let x1 = A[sb + 1u];
+  red[p] = x0 * x0 + x1 * x1;
+  workgroupBarrier();
+  for (var st = 32u; st > 0u; st >>= 1u) { if (p < st) { red[p] += red[p + st]; } workgroupBarrier(); }
+  let inv = inverseSqrt(red[0] / 128.0 + U.fa);
+  let a = x0 * inv * WD[U.f + 2u * p];
+  let b = x1 * inv * WD[U.f + 2u * p + 1u];
+  let row = (U.i + t) * 64u + p;
+  let c = WD[U.g + row]; let s = WD[U.h + row];
+  let db = U.d + t * U.e + hh * 128u + 2u * p;
+  A[db] = a * c - b * s;
+  A[db + 1u] = b * c + a * s;
+}
+
+// softmax over each row, in place: a=rows, b=width, c=offset
+@compute @workgroup_size(256)
+fn softmax(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) li: vec3u) {
+  let r = wg.x + wg.y * 65535u;
+  if (r >= U.a) { return; }
+  let i = li.x;
+  let base = U.c + r * U.b;
+  var m = -1e30;
+  for (var k = i; k < U.b; k += 256u) { m = max(m, A[base + k]); }
+  red[i] = m;
+  workgroupBarrier();
+  for (var st = 128u; st > 0u; st >>= 1u) { if (i < st) { red[i] = max(red[i], red[i + st]); } workgroupBarrier(); }
+  let mx = red[0];
+  workgroupBarrier();
+  var s = 0.0;
+  for (var k = i; k < U.b; k += 256u) { let e = exp(A[base + k] - mx); A[base + k] = e; s += e; }
+  red[i] = s;
+  workgroupBarrier();
+  for (var st = 128u; st > 0u; st >>= 1u) { if (i < st) { red[i] += red[i + st]; } workgroupBarrier(); }
+  let inv = 1.0 / red[0];
+  for (var k = i; k < U.b; k += 256u) { A[base + k] *= inv; }
+}
+
+// SwiGLU: out[r][j] = silu(in[r][j]) * in[r][half + j]
+// a=rows, b=half, c=in, d=in stride, e=out, f=out stride
+@compute @workgroup_size(256)
+fn swiglu(@builtin(global_invocation_id) g: vec3u) {
+  let j = g.x; let r = g.y;
+  if (j >= U.b || r >= U.a) { return; }
+  let x = A[U.c + r * U.d + j];
+  A[U.e + r * U.f + j] = x / (1.0 + exp(-x)) * A[U.c + r * U.d + U.b + j];
+}
+
+// The painting this block has in mind: x0 = x_t - sigma * v_lens, written in TAEF2's layout [32][64][64].
+// a=values (1024 * 128), b=v_lens [1024][128] (no bias), c=lens bias (WD), d=lat, e=x0 out, fa=sigma
+@compute @workgroup_size(256)
+fn lens_x0(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= U.a) { return; }
+  let t = i / 128u; let ch = i % 128u;
+  let h = t / 32u; let w = t % 32u;
+  let c = ch / 4u; let dy = (ch % 4u) / 2u; let dx = ch % 2u;
+  A[U.e + (c * 64u + 2u * h + dy) * 64u + 2u * w + dx] = A[U.d + i] - U.fa * (A[U.b + i] + WD[U.c + ch]);
+}
+
+// How much each image patch attends to each prompt word (mean over heads) in the last attention.
+// a=image tokens, b=words, c=probabilities [heads][joint][joint], d=joint index of the first word, e=out [a][b],
+// f=joint index of the first image token, g=joint length, h=heads
+@compute @workgroup_size(64)
+fn attn_words(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x; let j = g.y;
+  if (i >= U.a || j >= U.b) { return; }
+  var s = 0.0;
+  for (var hh = 0u; hh < U.h; hh++) { s += A[U.c + (hh * U.g + U.f + i) * U.g + U.d + j]; }
+  A[U.e + i * U.b + j] = s / f32(U.h);
+}
+
+// For drawing the computation as threads: the mean of a block of rows (a = rows, b = width, c = rows, d = mean out)
+@compute @workgroup_size(256)
+fn row_mean(@builtin(global_invocation_id) g: vec3u) {
+  let k = g.x;
+  if (k >= U.b) { return; }
+  var s = 0.0;
+  for (var r = 0u; r < U.a; r++) { s += A[U.c + r * U.b + k]; }
+  A[U.d + k] = s / f32(U.a);
+}
+
+// ... and each row, less that mean, projected on three fixed directions (WD at f, [3][b]), with its length:
+// out at d, 4 per row (b = width, c = rows, e = mean)
+var<workgroup> red4: array<vec4f, 128>;
+@compute @workgroup_size(128)
+fn row_project(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) li: vec3u) {
+  let r = wg.x; let i = li.x;
+  var p = vec4f(0.0);
+  for (var k = i; k < U.b; k += 128u) {
+    let v = A[U.c + r * U.b + k] - A[U.e + k];
+    p += vec4f(v * WD[U.f + k], v * WD[U.f + U.b + k], v * WD[U.f + 2u * U.b + k], v * v);
+  }
+  red4[i] = p;
+  workgroupBarrier();
+  for (var st = 64u; st > 0u; st >>= 1u) { if (i < st) { red4[i] += red4[i + st]; } workgroupBarrier(); }
+  if (i == 0u) {
+    let t = red4[0];
+    A[U.d + r * 4u] = t.x; A[U.d + r * 4u + 1u] = t.y; A[U.d + r * 4u + 2u] = t.z; A[U.d + r * 4u + 3u] = sqrt(t.w);
+  }
+}
+
+// Euler step: lat += fa * vel.  a=count, b=lat, c=vel
+@compute @workgroup_size(256)
+fn euler(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= U.a) { return; }
+  A[U.b + g.x] += U.fa * A[U.c + g.x];
+}
+
+// Strided batched GEMM (f32): C[z][m][n] = fa * sum_k A[z][m][k] B[z](k, n)  (+ C if accumulate)
+// a=M, b=N, c=K, d=A, e=lda, f=A batch stride, g=B, h=ldb, i=B batch stride, j=C, k=ldc, l=C batch stride,
+// m=flags: 1 B from the weights buffer, 2 B stored [k][n] (else [n][k]), 4 accumulate into C
+var<workgroup> As: array<f32, 2048>;
+var<workgroup> Bs: array<f32, 2048>;
+fn bval(o: u32) -> f32 { if ((U.m & 1u) != 0u) { return WD[o]; } return A[o]; }
+@compute @workgroup_size(16, 16)
+fn dgemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) li: vec3u, @builtin(local_invocation_index) lid: u32) {
+  let m0 = wg.y * 64u; let n0 = wg.x * 64u; let z = wg.z;
+  let ab = U.d + z * U.f; let bb = U.g + z * U.i; let cb = U.j + z * U.l;
+  let nn = (U.m & 2u) != 0u;
+  var acc0 = vec4f(0.0); var acc1 = vec4f(0.0); var acc2 = vec4f(0.0); var acc3 = vec4f(0.0);
+  for (var k0 = 0u; k0 < U.c; k0 += 32u) {
+    for (var i = 0u; i < 8u; i++) {
+      let idx = lid + i * 256u;
+      let r = idx / 32u; let kk = idx % 32u;
+      var v = 0.0;
+      if (m0 + r < U.a && k0 + kk < U.c) { v = A[ab + (m0 + r) * U.e + k0 + kk]; }
+      As[kk * 64u + r] = v;
+    }
+    for (var i = 0u; i < 8u; i++) {
+      let idx = lid + i * 256u;
+      var c = 0u; var kk = 0u;
+      if (nn) { kk = idx / 64u; c = idx % 64u; } else { c = idx / 32u; kk = idx % 32u; }
+      var v = 0.0;
+      if (n0 + c < U.b && k0 + kk < U.c) {
+        if (nn) { v = bval(bb + (k0 + kk) * U.h + n0 + c); } else { v = bval(bb + (n0 + c) * U.h + k0 + kk); }
+      }
+      Bs[kk * 64u + c] = v;
+    }
+    workgroupBarrier();
+    for (var kk = 0u; kk < 32u; kk++) {
+      let a = vec4f(As[kk * 64u + li.y * 4u], As[kk * 64u + li.y * 4u + 1u], As[kk * 64u + li.y * 4u + 2u], As[kk * 64u + li.y * 4u + 3u]);
+      let b = vec4f(Bs[kk * 64u + li.x * 4u], Bs[kk * 64u + li.x * 4u + 1u], Bs[kk * 64u + li.x * 4u + 2u], Bs[kk * 64u + li.x * 4u + 3u]);
+      acc0 += a.x * b; acc1 += a.y * b; acc2 += a.z * b; acc3 += a.w * b;
+    }
+    workgroupBarrier();
+  }
+  let accs = array<vec4f, 4>(acc0, acc1, acc2, acc3);
+  for (var i = 0u; i < 4u; i++) {
+    let m = m0 + li.y * 4u + i;
+    if (m >= U.a) { continue; }
+    for (var j = 0u; j < 4u; j++) {
+      let n = n0 + li.x * 4u + j;
+      if (n >= U.b) { continue; }
+      let o = cb + m * U.k + n;
+      var v = U.fa * accs[i][j];
+      if ((U.m & 4u) != 0u) { v += A[o]; }
+      A[o] = v;
+    }
+  }
+}`;
+
+type Kernel =
+	| 'modulate'
+	| 'qknorm_rope'
+	| 'softmax'
+	| 'swiglu'
+	| 'euler'
+	| 'dgemm'
+	| 'lens_x0'
+	| 'attn_words'
+	| 'row_mean'
+	| 'row_project';
+type Op =
+	| { k: 'kernel'; name: Kernel; p: number[]; f?: number[]; wg: [number, number, number] }
+	| { k: 'gemm'; job: GemmJob };
+
+export interface PainterProgress {
+	stage: string;
+	fraction: number;
+}
+
+/** Called after every block of every step with where things stand (for the visuals). */
+export type BlockHook = (step: number, block: number) => void | Promise<void>;
+
+/**
+ * The painter's states after one block, on the drawing space: per image patch and per prompt row (from row 3), the
+ * projections on three fixed directions and the length of the state less the group's mean (4 floats each); and the
+ * block's quick picture (64 x 64 rgba floats), for the patches' colours.
+ */
+export interface BlockSpace {
+	img: Float32Array;
+	txt: Float32Array;
+	colours: Float32Array | null;
+}
+
+export class Painter {
+	readonly taef2: Taef2;
+	/** Real (unpadded) rows of the prompt the painter last read. */
+	private textRows = 4;
+	readonly arena: GPUBuffer;
+	private dense: GPUBuffer;
+	private gemm: TernaryGemm;
+	private pipes: Record<Kernel, GPUComputePipeline>;
+	private bind: GPUBindGroup;
+	private params: GPUBuffer;
+	private tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
+	private denseAt = new Map<string, number>();
+	readonly at: Record<string, number>;
+	sigmas: number[];
+	steps = 4;
+	private schedules?: {
+		meta: Record<string, { sigmas: number[]; offset: number }>;
+		data: Float32Array;
+	};
+	readonly manifest: PainterFiles['manifest'];
+
+	private constructor(
+		private device: GPUDevice,
+		files: PainterFiles,
+		codes: GPUBuffer,
+		scales: GPUBuffer,
+		dense: GPUBuffer,
+		tern: Map<string, { rows: number; cols: number; codes: number; scales: number }>,
+		denseAt: Map<string, number>,
+		probes: Map<string, Float32Array> // colour probes for the decoder's stages (probe64, probe128, probe256)
+	) {
+		this.manifest = files.manifest;
+		this.dense = dense;
+		this.tern = tern;
+		this.denseAt = denseAt;
+		this.sigmas = (files.manifest.schedule as { sigmas: number[] }).sigmas;
+		// activations
+		let o = 0;
+		const regions: [string, number][] = [
+			['lat', NI * CIN],
+			['noise', NI * CIN],
+			['vel', NI * CIN],
+			['taps', NT * TAP],
+			['ctx', NT * CTX],
+			['h', NJ * D],
+			['n1', NJ * D],
+			['q', NJ * D],
+			['k', NJ * D],
+			['v', NJ * D],
+			['o', NJ * D],
+			['p', NJ * (3 * D + 2 * MLP)],
+			['cat', NJ * (D + MLP)],
+			['s', H * NJ * NJ],
+			['mod', 12 * 17 * D],
+			['abias', CTX],
+			['vl', NI * CIN],
+			['x0', 32 * 64 * 64],
+			['aw', NI * 128],
+			['awt', 128 * 128], // the prompt's words reading each other (joint attention, text rows)
+			['mu', 2 * D], // the mean image row and mean text row after a block
+			['proj', NJ * 4] // each row's projection on the drawing space (image rows, then text rows)
+		];
+		const at: Record<string, number> = {};
+		for (const [name, n] of regions) {
+			at[name] = o;
+			o += Math.ceil(n / 64) * 64;
+		}
+		this.at = at;
+		this.arena = device.createBuffer({
+			label: 'painter activations',
+			size: o * 4,
+			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+		});
+		// timestep-only vectors and the adapter's constants live in the arena, where the GEMM epilogues can read them
+		const mods = ['double_img', 'double_txt', 'single', 'norm_out'].map((k) =>
+			files.dense(`mod.${k}`)
+		);
+		for (let s = 0; s < 4; s++) {
+			const row = new Float32Array(17 * D);
+			row.set(mods[0].subarray(s * 6 * D, (s + 1) * 6 * D), 0);
+			row.set(mods[1].subarray(s * 6 * D, (s + 1) * 6 * D), 6 * D);
+			row.set(mods[2].subarray(s * 3 * D, (s + 1) * 3 * D), 12 * D);
+			row.set(mods[3].subarray(s * 2 * D, (s + 1) * 2 * D), 15 * D);
+			device.queue.writeBuffer(this.arena, (at.mod + s * 17 * D) * 4, row);
+		}
+		device.queue.writeBuffer(this.arena, at.abias * 4, files.dense('adapter.bias'));
+		device.queue.writeBuffer(this.arena, at.ctx * 4, files.dense('adapter.prefix'));
+
+		this.gemm = new TernaryGemm(device, codes, scales, this.arena, 1024);
+		const module = device.createShaderModule({ label: 'painter', code: WGSL });
+		const layout = device.createBindGroupLayout({
+			entries: [
+				{
+					binding: 0,
+					visibility: GPUShaderStage.COMPUTE,
+					buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 80 }
+				},
+				{ binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+				{ binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }
+			]
+		});
+		const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+		const names: Kernel[] = [
+			'modulate',
+			'qknorm_rope',
+			'softmax',
+			'swiglu',
+			'euler',
+			'dgemm',
+			'lens_x0',
+			'attn_words',
+			'row_mean',
+			'row_project'
+		];
+		this.pipes = Object.fromEntries(
+			names.map((e) => [
+				e,
+				device.createComputePipeline({ layout: pl, compute: { module, entryPoint: e } })
+			])
+		) as Record<Kernel, GPUComputePipeline>;
+		this.params = device.createBuffer({
+			size: 1024 * 256,
+			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+		});
+		this.bind = device.createBindGroup({
+			layout,
+			entries: [
+				{ binding: 0, resource: { buffer: this.params, size: 80 } },
+				{ binding: 1, resource: { buffer: dense } },
+				{ binding: 2, resource: { buffer: this.arena } }
+			]
+		});
+		const tw = new Map(files.names('taef2.').map((k) => [k.slice(6), files.dense(k)]));
+		for (const [k, v] of probes) tw.set(k, v);
+		this.taef2 = new Taef2(device, tw, 512);
+	}
+
+	/** Download the painter (about 1.1 GB) and put it on the GPU. */
+	static async load(
+		device: GPUDevice,
+		base: string,
+		onProgress?: (p: PainterProgress) => void
+	): Promise<Painter> {
+		const files = await PainterFiles.open(base);
+		const names = Object.keys(files.manifest.files as Record<string, unknown>);
+		const tensors = files.manifest.tensors;
+		// one codes buffer and one scales buffer for every ternary tensor (DiT and adapter)
+		const tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
+		let nc = 0,
+			ns = 0;
+		for (const [k, e] of Object.entries(tensors)) {
+			if (e.kind !== 'ternary') continue;
+			tern.set(k, { rows: e.shape[0], cols: e.shape[1], codes: nc, scales: ns });
+			nc += e.codes.bytes / 4;
+			ns += e.scales.bytes / 4;
+		}
+		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+		const codes = device.createBuffer({ label: 'painter codes', size: nc * 4, usage });
+		const scales = device.createBuffer({ label: 'painter scales', size: ns * 4, usage });
+		// dense weights the DiT reads: embedders, projection out, QK gains, rope tables
+		const denseNames = Object.keys(tensors).filter(
+			(k) =>
+				tensors[k].kind === 'dense' &&
+				!k.startsWith('taef2.') &&
+				!k.startsWith('mod.') &&
+				!k.startsWith('adapter.') &&
+				k !== 'temb'
+		);
+		const denseAt = new Map<string, number>();
+		let nd = 0;
+		for (const k of denseNames) {
+			denseAt.set(k, nd);
+			nd += (tensors[k] as { shape: number[] }).shape.reduce((a, b) => a * b, 1);
+		}
+		// optional readouts for the visuals: the tuned lens and the latent colour probe (viz.json / viz.bin)
+		const viz = await fetchModelJson<
+			Record<
+				'lens' | 'probe' | 'probe64' | 'probe128' | 'probe256' | 'space_img' | 'space_txt',
+				{ shape: number[]; offset: number; bytes: number }
+			>
+		>(`${base}/viz.json`).catch(() => null);
+		if (viz) {
+			denseAt.set('viz.lens', nd);
+			nd += viz.lens.shape.reduce((a, b) => a * b, 1);
+			denseAt.set('viz.probe', nd);
+			nd += 99;
+			for (const k of ['space_img', 'space_txt'] as const)
+				if (viz[k]) {
+					denseAt.set(`viz.${k}`, nd);
+					nd += 3 * D;
+				}
+		}
+		const dense = device.createBuffer({ label: 'painter dense', size: nd * 4, usage });
+		const probes = new Map<string, Float32Array>();
+		if (viz) {
+			const bin = await fetchModelFile(`${base}/viz.bin`);
+			const h = new Uint16Array(bin, viz.lens.offset, viz.lens.bytes / 2);
+			const lens = new Float32Array(h.length);
+			for (let i = 0; i < h.length; i++) lens[i] = halfToFloat(h[i]);
+			device.queue.writeBuffer(dense, denseAt.get('viz.lens')! * 4, lens);
+			device.queue.writeBuffer(
+				dense,
+				denseAt.get('viz.probe')! * 4,
+				new Float32Array(bin, viz.probe.offset, 99)
+			);
+			for (const k of ['space_img', 'space_txt'] as const)
+				if (viz[k])
+					device.queue.writeBuffer(
+						dense,
+						denseAt.get(`viz.${k}`)! * 4,
+						new Float32Array(bin.slice(viz[k].offset, viz[k].offset + 3 * D * 4))
+					);
+			for (const k of ['probe64', 'probe128', 'probe256'] as const)
+				if (viz[k])
+					probes.set(k, new Float32Array(bin.slice(viz[k].offset, viz[k].offset + 195 * 4)));
+		}
+		// fetch file by file, uploading as each arrives
+		const total = names.reduce(
+			(a, n) => a + (files.manifest.files as Record<string, { bytes: number }>)[n].bytes,
+			0
+		);
+		let done = 0;
+		for (const n of names) {
+			await files.fetch([n], (f) =>
+				onProgress?.({
+					stage: 'Downloading the painter',
+					fraction:
+						(done + f * (files.manifest.files as Record<string, { bytes: number }>)[n].bytes) /
+						total
+				})
+			);
+			done += (files.manifest.files as Record<string, { bytes: number }>)[n].bytes;
+			for (const [k, e] of Object.entries(tensors)) {
+				if (e.file !== n) continue;
+				if (e.kind === 'ternary') {
+					const t = files.ternary(k),
+						where = tern.get(k)!;
+					device.queue.writeBuffer(codes, where.codes * 4, t.codes);
+					device.queue.writeBuffer(scales, where.scales * 4, t.scales);
+				} else if (denseAt.has(k))
+					device.queue.writeBuffer(dense, denseAt.get(k)! * 4, files.dense(k));
+			}
+			if (n.startsWith('dit_') && n !== 'dit_misc.bin') files.release(n);
+		}
+		onProgress?.({ stage: 'Ready', fraction: 1 });
+		const painter = new Painter(device, files, codes, scales, dense, tern, denseAt, probes);
+		// other step counts (optional): sigmas and modulation per step, see export_painter_schedules.py
+		const sj = await fetchModelJson<
+			Record<string, Record<string, { sigmas: number[]; offset: number }>>
+		>(`${base}/schedules.json`).catch(() => null);
+		if (sj) {
+			const data = new Float32Array(await fetchModelFile(`${base}/schedules.bin`));
+			painter.schedules = { meta: sj['512'], data };
+		}
+		return painter;
+	}
+
+	private t(name: string) {
+		const t = this.tern.get(name);
+		if (!t) throw new Error(`The painter has no ternary ${name}.`);
+		return t;
+	}
+
+	private w(name: string) {
+		const o = this.denseAt.get(name);
+		if (o === undefined) throw new Error(`The painter has no dense ${name}.`);
+		return o;
+	}
+
+	/** Text side: the 1.7B reads the prompt padded to 512 tokens; its layers 7, 14, 21 become the conditioning. */
+	async encode(llm: BonsaiLLM, prompt: string) {
+		const text = (this.manifest.text as { template: string }).template
+			.replaceAll('\\n', '\n')
+			.replace('{prompt}', prompt);
+		const real = llm.tokenizer.encode(text).slice(0, NT);
+		const n = real.length;
+		const ids = real.concat(
+			new Array(NT - n).fill((this.manifest.text as { pad_id: number }).pad_id)
+		);
+		const taps = await llm.encodeLong(ids, [7, 14, 21], n);
+		const rows = new Float32Array(NT * TAP);
+		for (let t = 0; t < NT; t++)
+			for (let k = 0; k < 3; k++)
+				rows.set(taps[k].subarray(t * 2048, (t + 1) * 2048), t * TAP + k * 2048);
+		this.device.queue.writeBuffer(this.arena, this.at.taps * 4, rows);
+		// adapter: rows 3.. only (the first three rows are the fixed prefix, already in place)
+		const a = this.t('adapter.weight');
+		this.run([
+			{
+				k: 'gemm',
+				job: {
+					M: NT - 3,
+					N: CTX,
+					K: TAP,
+					codes: a.codes,
+					scales: a.scales,
+					x: this.at.taps + 3 * TAP,
+					y: this.at.ctx + 3 * CTX,
+					bias: this.at.abias
+				}
+			}
+		]);
+		await this.device.queue.onSubmittedWorkDone();
+		return { ids, real: n };
+	}
+
+	/** Start from the given noise (1024 x 128, bn-normalised latent space) or from seeded Gaussian noise. */
+	setNoise(noise?: Float32Array, seed = 7) {
+		let z = noise;
+		if (!z) {
+			z = new Float32Array(NI * CIN);
+			let s = seed >>> 0 || 1;
+			const rnd = () => ((s = (s * 1664525 + 1013904223) >>> 0) + 0.5) / 4294967296;
+			for (let i = 0; i < z.length; i += 2) {
+				const r = Math.sqrt(-2 * Math.log(rnd())),
+					th = 2 * Math.PI * rnd();
+				z[i] = r * Math.cos(th);
+				z[i + 1] = r * Math.sin(th);
+			}
+		}
+		this.device.queue.writeBuffer(this.arena, this.at.lat * 4, z);
+		this.device.queue.writeBuffer(this.arena, this.at.noise * 4, z);
+	}
+
+	/** One denoising step (0..3): the DiT's 25 blocks, then the Euler update. Calls onBlock after each block. */
+	async step(s: number, onBlock?: BlockHook) {
+		const { ops, hooks } = this.stepOps(s);
+		// submit block by block so the visuals can look in between
+		let from = 0;
+		for (const [to, b] of hooks) {
+			this.run(ops.slice(from, to));
+			from = to;
+			await this.device.queue.onSubmittedWorkDone();
+			await onBlock?.(s, b);
+		}
+	}
+
+	/** The ops of one step and where its blocks end: [op index after which, block] (-1 embedded, 25 done). */
+	private stepOps(s: number) {
+		const at = this.at,
+			mod = at.mod + s * 17 * D;
+		const MI = (r: number) => mod + r * D,
+			MT = (r: number) => mod + (6 + r) * D,
+			MS = (r: number) => mod + (12 + r) * D,
+			MO = (r: number) => mod + (15 + r) * D;
+		const T0 = 0,
+			I0 = NT * D; // row offsets of the text and image parts of the joint stream
+		const ops: Op[] = [];
+		const K = (name: Kernel, p: number[], wg: [number, number, number], f: number[] = []) =>
+			ops.push({ k: 'kernel', name, p, f, wg });
+		const G = (w: string, M: number, x: number, y: number, extra: Partial<GemmJob> = {}) => {
+			const t = this.t(w);
+			ops.push({
+				k: 'gemm',
+				job: { M, N: t.rows, K: t.cols, codes: t.codes, scales: t.scales, x, y, ...extra }
+			});
+		};
+		const modulate = (rows: number, x: number, y: number, shift: number, scale: number) =>
+			K('modulate', [rows, D, x, y, shift, scale, D, D], [rows, 1, 1], [1e-6]);
+		const qk = (
+			tokens: number,
+			src: number,
+			stride: number,
+			dst: number,
+			gain: string,
+			first: number
+		) =>
+			K(
+				'qknorm_rope',
+				[tokens, src, stride, dst, D, this.w(gain), this.w('rope.cos'), this.w('rope.sin'), first],
+				[tokens, H, 1],
+				[1e-6]
+			);
+		const attention = (v: number, vStride: number, out: number, outStride: number) => {
+			K(
+				'dgemm',
+				[NJ, NJ, HD, at.q, D, HD, at.k, D, HD, at.s, NJ, NJ * NJ, 0],
+				[NJ / 64, NJ / 64, H],
+				[1 / Math.sqrt(HD)]
+			);
+			K('softmax', [H * NJ, NJ, at.s], [Math.min(H * NJ, 65535), Math.ceil((H * NJ) / 65535), 1]);
+			K(
+				'dgemm',
+				[NJ, HD, NJ, at.s, NJ, NJ * NJ, v, vStride, HD, out, outStride, HD, 2],
+				[HD / 64, NJ / 64, H],
+				[1]
+			);
+		};
+
+		const hooks: [number, number][] = []; // [op index after which, block] (-1 = embedded, 25 = step done)
+		// embed: image tokens from the latent, text tokens from the conditioning
+		{
+			K(
+				'dgemm',
+				[NI, D, CIN, at.lat, CIN, 0, this.w('x_embedder.weight'), CIN, 0, at.h + I0, D, 0, 1],
+				[D / 64, NI / 64, 1],
+				[1]
+			);
+			K(
+				'dgemm',
+				[NT, D, CTX, at.ctx, CTX, 0, this.w('context_embedder.weight'), CTX, 0, at.h + T0, D, 0, 1],
+				[D / 64, NT / 64, 1],
+				[1]
+			);
+		}
+		hooks.push([ops.length, -1]);
+		for (let b = 0; b < 5; b++) {
+			const P = `transformer_blocks.${b}.`;
+			modulate(NT, at.h + T0, at.n1 + T0, MT(0), MT(1));
+			modulate(NI, at.h + I0, at.n1 + I0, MI(0), MI(1));
+			G(P + 'attn.add_q_proj.weight', NT, at.n1 + T0, at.q + T0);
+			G(P + 'attn.add_k_proj.weight', NT, at.n1 + T0, at.k + T0);
+			G(P + 'attn.add_v_proj.weight', NT, at.n1 + T0, at.v + T0);
+			G(P + 'attn.to_q.weight', NI, at.n1 + I0, at.q + I0);
+			G(P + 'attn.to_k.weight', NI, at.n1 + I0, at.k + I0);
+			G(P + 'attn.to_v.weight', NI, at.n1 + I0, at.v + I0);
+			qk(NT, at.q + T0, D, at.q + T0, P + 'attn.norm_added_q.weight', 0);
+			qk(NI, at.q + I0, D, at.q + I0, P + 'attn.norm_q.weight', NT);
+			qk(NT, at.k + T0, D, at.k + T0, P + 'attn.norm_added_k.weight', 0);
+			qk(NI, at.k + I0, D, at.k + I0, P + 'attn.norm_k.weight', NT);
+			attention(at.v, D, at.o, D);
+			G(P + 'attn.to_out.0.weight', NI, at.o + I0, at.h + I0, { bias: MI(2), gated: true });
+			G(P + 'attn.to_add_out.weight', NT, at.o + T0, at.h + T0, { bias: MT(2), gated: true });
+			modulate(NI, at.h + I0, at.n1 + I0, MI(3), MI(4));
+			modulate(NT, at.h + T0, at.n1 + T0, MT(3), MT(4));
+			G(P + 'ff.linear_in.weight', NI, at.n1 + I0, at.p);
+			K('swiglu', [NI, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, NI, 1]);
+			G(P + 'ff.linear_out.weight', NI, at.cat, at.h + I0, { bias: MI(5), gated: true });
+			G(P + 'ff_context.linear_in.weight', NT, at.n1 + T0, at.p);
+			K('swiglu', [NT, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, NT, 1]);
+			G(P + 'ff_context.linear_out.weight', NT, at.cat, at.h + T0, { bias: MT(5), gated: true });
+			hooks.push([ops.length, b]);
+		}
+		const PW = 3 * D + 2 * MLP,
+			CW = D + MLP;
+		for (let b = 0; b < 20; b++) {
+			const P = `single_transformer_blocks.${b}.`;
+			modulate(NJ, at.h, at.n1, MS(0), MS(1));
+			G(P + 'attn.to_qkv_mlp_proj.weight', NJ, at.n1, at.p);
+			qk(NJ, at.p, PW, at.q, P + 'attn.norm_q.weight', 0);
+			qk(NJ, at.p + D, PW, at.k, P + 'attn.norm_k.weight', 0);
+			attention(at.p + 2 * D, PW, at.cat, CW);
+			K('swiglu', [NJ, MLP, at.p + 3 * D, PW, at.cat + D, CW], [MLP / 256, NJ, 1]);
+			G(P + 'attn.to_out.weight', NJ, at.cat, at.h, { bias: MS(2), gated: true });
+			hooks.push([ops.length, 5 + b]);
+		}
+		// velocity and the Euler update
+		modulate(NI, at.h + I0, at.n1 + I0, MO(1), MO(0));
+		K(
+			'dgemm',
+			[NI, CIN, D, at.n1 + I0, D, 0, this.w('proj_out.weight'), D, 0, at.vel, CIN, 0, 1],
+			[CIN / 64, NI / 64, 1],
+			[1]
+		);
+		K(
+			'euler',
+			[NI * CIN, at.lat, at.vel],
+			[Math.ceil((NI * CIN) / 256), 1, 1],
+			[this.sigmas[s + 1] - this.sigmas[s]]
+		);
+
+		hooks.push([ops.length, 25]);
+		return { ops, hooks };
+	}
+
+	// ---- scheduled work: the same computation cut into slices of a few milliseconds
+
+	private cost(o: Op): number {
+		if (o.k === 'gemm') return gemmMs(o.job.M, o.job.N, o.job.K);
+		const p = o.p;
+		switch (o.name) {
+			case 'dgemm':
+				return (2 * p[0] * p[1] * p[2] * o.wg[2]) / 0.8e9;
+			case 'softmax':
+				return p[0] * p[1] * 1.5e-7;
+			case 'modulate':
+				return p[0] * p[1] * 2e-7;
+			case 'swiglu':
+				return p[0] * p[1] * 1.5e-7;
+			case 'qknorm_rope':
+				return p[0] * 0.0004;
+			default:
+				return 0.2;
+		}
+	}
+
+	/** Cut an op into row slices that each cost at most `budget` ms (rows in multiples of 64 where it matters). */
+	private slice(o: Op, budget: number): Op[] {
+		const c = this.cost(o);
+		if (c <= budget) return [o];
+		const rows = o.k === 'gemm' ? o.job.M : o.p[0];
+		let R = Math.max(64, Math.floor((rows * budget) / c / 64) * 64);
+		if (o.k === 'kernel' && (o.name === 'softmax' || o.name === 'modulate' || o.name === 'swiglu'))
+			R = Math.max(1, Math.floor((rows * budget) / c));
+		if (o.k === 'kernel' && !['dgemm', 'softmax', 'modulate', 'swiglu'].includes(o.name))
+			return [o];
+		const out: Op[] = [];
+		for (let r0 = 0; r0 < rows; r0 += R) {
+			const n = Math.min(R, rows - r0);
+			if (o.k === 'gemm') {
+				const j = o.job;
+				out.push({ k: 'gemm', job: { ...j, M: n, x: j.x + r0 * j.K, y: j.y + r0 * j.N } });
+				continue;
+			}
+			const p = [...o.p];
+			let wg: [number, number, number];
+			if (o.name === 'dgemm') {
+				p[0] = n;
+				p[3] += r0 * p[4];
+				p[9] += r0 * p[10];
+				wg = [o.wg[0], Math.ceil(n / 64), o.wg[2]];
+			} else if (o.name === 'softmax') {
+				p[0] = n;
+				p[2] += r0 * p[1];
+				wg = [Math.min(n, 65535), Math.ceil(n / 65535), 1];
+			} else if (o.name === 'modulate') {
+				p[0] = n;
+				p[2] += r0 * p[6];
+				p[3] += r0 * p[7];
+				wg = [n, 1, 1];
+			} else {
+				p[0] = n;
+				p[2] += r0 * p[3];
+				p[4] += r0 * p[5];
+				wg = [o.wg[0], n, 1];
+			}
+			out.push({ ...o, p, wg });
+		}
+		return out;
+	}
+
+	/** Group ops into tasks of about `budget` ms; `done` runs after the last. */
+	private tasks(ops: Op[], budget: number, done?: () => void | Promise<void>): GpuTask[] {
+		const tasks: GpuTask[] = [];
+		let group: Op[] = [],
+			acc = 0;
+		const flush = () => {
+			if (!group.length) return;
+			const g = group;
+			tasks.push({ cost: acc, record: (enc, sub) => this.record(g, enc, sub) });
+			group = [];
+			acc = 0;
+		};
+		for (const big of ops)
+			for (const o of this.slice(big, budget)) {
+				const c = this.cost(o);
+				if (acc + c > budget) flush();
+				group.push(o);
+				acc += c;
+			}
+		flush();
+		if (done) tasks.push({ cost: 0, record: () => {}, done });
+		return tasks;
+	}
+
+	/** Text side as tasks: the 1.7B re-reads the prompt padded to 512 tokens, then the adapter. */
+	encodeTasks(llm: BonsaiLLM, prompt: string, budget = 9): { tasks: GpuTask[]; real: number } {
+		const tpl = (this.manifest.text as { template: string }).template;
+		const text = tpl.replaceAll('\\n', '\n').replace('{prompt}', prompt);
+		const real = llm.tokenizer.encode(text).slice(0, NT);
+		const n = real.length;
+		this.textRows = n;
+		const ids = real.concat(
+			new Array(NT - n).fill((this.manifest.text as { pad_id: number }).pad_id)
+		);
+		const tasks = llm.encodeLongTasks(ids, [7, 14, 21], n, budget);
+		// taps [3][512][2048] in the reader -> [512][h7 | h14 | h21] here, then the adapter (rows 3.. only)
+		tasks.push({
+			cost: 1,
+			record: (enc) => {
+				for (let t = 0; t < NT; t++)
+					for (let k = 0; k < 3; k++)
+						enc.copyBufferToBuffer(
+							llm.longTaps,
+							(k * NT + t) * 2048 * 4,
+							this.arena,
+							(this.at.taps + t * TAP + k * 2048) * 4,
+							2048 * 4
+						);
+			}
+		});
+		const a = this.t('adapter.weight');
+		tasks.push(
+			...this.tasks(
+				[
+					{
+						k: 'gemm',
+						job: {
+							M: NT - 3,
+							N: CTX,
+							K: TAP,
+							codes: a.codes,
+							scales: a.scales,
+							x: this.at.taps + 3 * TAP,
+							y: this.at.ctx + 3 * CTX,
+							bias: this.at.abias
+						}
+					}
+				],
+				budget
+			)
+		);
+		return { tasks, real: n };
+	}
+
+	/**
+	 * One step as tasks. After every block a readout: the painting it has in mind (TAEF2's quick picture, straight
+	 * into taef2.earlyTexture) and how much each patch attends to each prompt word, handed to onBlock. After the last
+	 * block, its guess of the finished picture is decoded in full, and `stage` hears of each of the decoder's stages
+	 * (128, 256: taef2.stageTextures; 512: taef2.texture), see Taef2.decodeTasks. onPicture is called while the
+	 * commands are recorded, right after each quick picture is made (to copy it before the next block replaces it).
+	 */
+	stepTasks(
+		s: number,
+		words: { first: number; count: number },
+		onBlock: (b: number, attn: Float32Array, space?: BlockSpace, words?: Float32Array) => void,
+		stage: { record?: (enc: GPUCommandEncoder, res: number) => void; done?: (res: number) => void },
+		budget = 9,
+		onPicture?: (enc: GPUCommandEncoder, b: number) => void,
+		onInput?: (space: BlockSpace) => void
+	): GpuTask[] {
+		const { ops, hooks } = this.stepOps(s);
+		const tasks: GpuTask[] = [];
+		let from = 0;
+		for (const [to, b] of hooks) {
+			tasks.push(...this.tasks(ops.slice(from, to), budget));
+			from = to;
+			if (b < 0 && onInput && this.hasSpace) tasks.push(this.inputTask(onInput));
+			if (b < 0 || b > 24) continue;
+			tasks.push(
+				this.readoutTask(
+					s,
+					b,
+					words,
+					(attn, space, w) => onBlock(b, attn, space, w),
+					onPicture && ((enc) => onPicture(enc, b))
+				)
+			);
+			if (b === 24) tasks.push(...this.taef2.decodeTasks(budget, stage));
+		}
+		return tasks;
+	}
+
+	/** Read the painter's states back on the drawing space after each block (see BlockSpace); off unless wanted. */
+	drawSpace = false;
+
+	/** Whether the drawing space for the painter's states is loaded (viz.bin space_img / space_txt) and wanted. */
+	get hasSpace() {
+		return this.drawSpace && this.denseAt.has('viz.space_img') && this.denseAt.has('viz.space_txt');
+	}
+
+	/** The image patches' states as the pass begins (the latent, embedded), on the drawing space. */
+	private inputTask(onSpace: (space: BlockSpace) => void): GpuTask {
+		const at = this.at,
+			img = at.h + NT * D;
+		const ops: Op[] = [
+			{ k: 'kernel', name: 'row_mean', p: [NI, D, img, at.mu], wg: [D / 256, 1, 1] },
+			{
+				k: 'kernel',
+				name: 'row_project',
+				p: [0, D, img, at.proj, at.mu, this.w('viz.space_img')],
+				wg: [NI, 1, 1]
+			}
+		];
+		let out: GPUBuffer;
+		return {
+			cost: 0.5,
+			record: (enc, sub) => {
+				this.record(ops, enc, sub);
+				out = this.device.createBuffer({
+					size: NI * 16,
+					usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+				});
+				enc.copyBufferToBuffer(this.arena, at.proj * 4, out, 0, NI * 16);
+			},
+			done: async () => {
+				await out.mapAsync(GPUMapMode.READ);
+				const img = new Float32Array(out.getMappedRange().slice(0));
+				out.destroy();
+				onSpace({ img, txt: new Float32Array(0), colours: null });
+			}
+		};
+	}
+
+	private readoutTask(
+		s: number,
+		b: number,
+		words: { first: number; count: number },
+		onData: (attn: Float32Array, space?: BlockSpace, words?: Float32Array) => void,
+		onPicture?: (enc: GPUCommandEncoder) => void
+	): GpuTask {
+		const at = this.at,
+			count = words.count;
+		const ops: Op[] = [];
+		// the states after this block, projected on the drawing space: every image patch, and the prompt's real rows
+		// (from row 3; each group less its own mean)
+		const space = this.hasSpace;
+		const nt = Math.max(1, this.textRows - 3);
+		if (space) {
+			const img = at.h + NT * D,
+				txt = at.h + 3 * D;
+			ops.push(
+				{ k: 'kernel', name: 'row_mean', p: [NI, D, img, at.mu], wg: [D / 256, 1, 1] },
+				{
+					k: 'kernel',
+					name: 'row_project',
+					p: [0, D, img, at.proj, at.mu, this.w('viz.space_img')],
+					wg: [NI, 1, 1]
+				},
+				{ k: 'kernel', name: 'row_mean', p: [nt, D, txt, at.mu + D], wg: [D / 256, 1, 1] },
+				{
+					k: 'kernel',
+					name: 'row_project',
+					p: [0, D, txt, at.proj + NI * 4, at.mu + D, this.w('viz.space_txt')],
+					wg: [nt, 1, 1]
+				}
+			);
+		}
+		const lens = this.hasLens && this.taef2.hasEarly;
+		if (lens) {
+			const L = this.w('viz.lens') + b * 3073 * CIN;
+			ops.push({
+				k: 'kernel',
+				name: 'dgemm',
+				p: [NI, CIN, D, at.h + NT * D, D, 0, L, CIN, 0, at.vl, CIN, 0, 3],
+				f: [1],
+				wg: [CIN / 64, NI / 64, 1]
+			});
+			ops.push({
+				k: 'kernel',
+				name: 'lens_x0',
+				p: [NI * CIN, at.vl, L + 3072 * CIN, at.lat, at.x0],
+				f: [this.sigmas[s]],
+				wg: [(NI * CIN) / 256, 1, 1]
+			});
+		}
+		ops.push({
+			k: 'kernel',
+			name: 'attn_words',
+			p: [NI, count, at.s, words.first, at.aw, NT, NJ, H],
+			wg: [NI / 64, count, 1]
+		});
+		// and how the words read each other in this block: [word][word], averaged over the heads
+		const nW = Math.min(count, 128);
+		ops.push({
+			k: 'kernel',
+			name: 'attn_words',
+			p: [nW, nW, at.s, words.first, at.awt, words.first, NJ, H],
+			wg: [Math.ceil(nW / 64), nW, 1]
+		});
+		let out: GPUBuffer;
+		// read back: attention [NI][count], then (with the space) projections [NI + nt][4], then the quick picture
+		// as rgba floats [64 * 64][4] (the patches' colours)
+		const nA = NI * count,
+			nP = space ? (NI + nt) * 4 : 0,
+			nC = space && lens ? 64 * 64 * 4 : 0,
+			nT = nW * nW;
+		return {
+			cost: 4,
+			record: (enc, sub) => {
+				this.record(ops, enc, sub);
+				out = this.device.createBuffer({
+					size: (nA + nP + nC + nT) * 4,
+					usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+				});
+				enc.copyBufferToBuffer(this.arena, at.aw * 4, out, 0, nA * 4);
+				if (nP) enc.copyBufferToBuffer(this.arena, at.proj * 4, out, nA * 4, nP * 4);
+				enc.copyBufferToBuffer(this.arena, at.awt * 4, out, (nA + nP + nC) * 4, nT * 4);
+				if (lens) {
+					this.taef2.copyLatent(enc, this.arena, at.x0);
+					this.taef2.decodeEarly(enc);
+					if (nC) this.taef2.copyEarly(enc, out, (nA + nP) * 4);
+					onPicture?.(enc);
+				}
+			},
+			done: async () => {
+				await out.mapAsync(GPUMapMode.READ);
+				const all = new Float32Array(out.getMappedRange().slice(0));
+				out.destroy();
+				onData(
+					all.subarray(0, nA),
+					nP
+						? {
+								img: all.subarray(nA, nA + NI * 4),
+								txt: all.subarray(nA + NI * 4, nA + nP),
+								colours: nC ? all.subarray(nA + nP, nA + nP + nC) : null
+							}
+						: undefined,
+					all.subarray(nA + nP + nC)
+				);
+			}
+		};
+	}
+
+	/** The finished picture as tasks: the final latent through TAEF2 into taef2.texture, then onDone. */
+	finalTasks(onDone: () => void, budget = 9): GpuTask[] {
+		const at = this.at;
+		return [
+			{
+				cost: 1,
+				record: (enc, sub) => {
+					// unpatchify the latent (the lens kernel with sigma 0 is exactly that)
+					this.record(
+						[
+							{
+								k: 'kernel',
+								name: 'lens_x0',
+								p: [NI * CIN, at.vl, 0, at.lat, at.x0],
+								f: [0],
+								wg: [(NI * CIN) / 256, 1, 1]
+							}
+						],
+						enc,
+						sub
+					);
+					this.taef2.copyLatent(enc, this.arena, at.x0);
+				}
+			},
+			...this.taef2.decodeTasks(budget),
+			{ cost: 0, record: () => {}, done: onDone }
+		];
+	}
+
+	private run(ops: Op[]) {
+		const enc = this.device.createCommandEncoder();
+		this.record(ops, enc);
+		this.device.queue.submit([enc.finish()]);
+	}
+
+	private slotSub = -1;
+	private slotAt = 0;
+	private gemmAt = 0;
+
+	/** Record ops; within one scheduler submission (`sub`) each call gets uniform slots of its own. */
+	private record(ops: Op[], enc: GPUCommandEncoder, sub?: number) {
+		const dev = this.device;
+		if (sub === undefined || sub !== this.slotSub) {
+			this.slotSub = sub ?? -1;
+			this.slotAt = 0;
+			this.gemmAt = 0;
+		}
+		const k0 = this.slotAt,
+			g0 = this.gemmAt;
+		const kernels = ops.filter((o) => o.k === 'kernel');
+		const data = new ArrayBuffer(Math.max(1, kernels.length) * 256);
+		kernels.forEach((o, i) => {
+			new Uint32Array(data, i * 256, 16).set(o.p.map((x) => x >>> 0));
+			new Float32Array(data, i * 256 + 64, 4).set(o.f ?? []);
+		});
+		const jobs = ops.flatMap((o) => (o.k === 'gemm' ? [o.job] : []));
+		if (k0 + kernels.length > 1024 || g0 + jobs.length > 1024)
+			throw new Error('Too much painter work in one submission.');
+		if (kernels.length) dev.queue.writeBuffer(this.params, k0 * 256, data);
+		if (jobs.length) this.gemm.prepare(jobs, g0);
+		this.slotAt += kernels.length;
+		this.gemmAt += jobs.length;
+		const pass = enc.beginComputePass();
+		let ki = k0,
+			gi = g0;
+		for (const o of ops) {
+			if (o.k === 'kernel') {
+				pass.setPipeline(this.pipes[o.name]);
+				pass.setBindGroup(0, this.bind, [ki++ * 256]);
+				pass.dispatchWorkgroups(...o.wg);
+			} else this.gemm.dispatch(pass, gi++, o.job);
+		}
+		pass.end();
+	}
+
+	/** Step counts this painter can run (4 always; others when schedules.json is present). */
+	get stepChoices(): number[] {
+		return this.schedules
+			? Object.keys(this.schedules.meta)
+					.map(Number)
+					.sort((a, b) => a - b)
+			: [4];
+	}
+
+	/** Use a schedule of n steps (sigmas and the per-step modulation). */
+	setSteps(n: number) {
+		const sc = this.schedules?.meta[String(n)];
+		if (!sc || !this.schedules) {
+			if (n !== 4) throw new Error(`The painter has no ${n}-step schedule.`);
+			return;
+		}
+		this.steps = n;
+		this.sigmas = sc.sigmas;
+		this.device.queue.writeBuffer(
+			this.arena,
+			this.at.mod * 4,
+			this.schedules.data.subarray(sc.offset, sc.offset + n * 17 * D)
+		);
+	}
+
+	get hasLens() {
+		return this.denseAt.has('viz.lens');
+	}
+
+	/**
+	 * What the visuals show after block b (0..24) of step s, read back from the GPU:
+	 *   rgb   [64 x 64 x 4]  the painting this block has in mind (tuned lens, x0 = x_t - sigma v, colour probe)
+	 *   attn  [1024 x count] how much each image patch attends to each prompt word (mean over heads)
+	 *   text  [count x 3072] the prompt words' states in the painter
+	 * words: joint index of the first prompt word and how many there are. Block -1 gives only text.
+	 */
+	async readouts(s: number, b: number, first: number, count: number, full = false) {
+		const at = this.at,
+			dev = this.device;
+		const ops: Op[] = [];
+		const block = b >= 0 && b < 25;
+		const lens = block && this.hasLens && this.taef2.hasEarly;
+		if (lens) {
+			const L = this.w('viz.lens') + b * 3073 * CIN;
+			ops.push({
+				k: 'kernel',
+				name: 'dgemm',
+				p: [NI, CIN, D, at.h + NT * D, D, 0, L, CIN, 0, at.vl, CIN, 0, 3],
+				f: [1],
+				wg: [CIN / 64, NI / 64, 1]
+			});
+			ops.push({
+				k: 'kernel',
+				name: 'lens_x0',
+				p: [NI * CIN, at.vl, L + 3072 * CIN, at.lat, at.x0],
+				f: [this.sigmas[s]],
+				wg: [(NI * CIN) / 256, 1, 1]
+			});
+		}
+		if (block)
+			ops.push({
+				k: 'kernel',
+				name: 'attn_words',
+				p: [NI, count, at.s, first, at.aw, NT, NJ, H],
+				wg: [NI / 64, count, 1]
+			});
+		const enc = dev.createCommandEncoder();
+		if (ops.length) this.record(ops, enc);
+		const textN = count * D,
+			attnN = block ? NI * count : 0,
+			rgbN = lens ? 4096 * 4 : 0;
+		const out = dev.createBuffer({
+			size: (textN + attnN + rgbN) * 4,
+			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+		});
+		enc.copyBufferToBuffer(this.arena, (at.h + first * D) * 4, out, 0, textN * 4);
+		if (attnN) enc.copyBufferToBuffer(this.arena, at.aw * 4, out, textN * 4, attnN * 4);
+		if (lens) {
+			this.taef2.copyLatent(enc, this.arena, at.x0);
+			this.taef2.decodeEarly(enc);
+			this.taef2.copyEarly(enc, out, (textN + attnN) * 4);
+			if (full) this.taef2.decode(enc);
+		}
+		dev.queue.submit([enc.finish()]);
+		await out.mapAsync(GPUMapMode.READ);
+		const all = new Float32Array(out.getMappedRange().slice(0));
+		out.destroy();
+		return {
+			text: all.subarray(0, textN),
+			attn: attnN ? all.subarray(textN, textN + attnN) : null,
+			rgb: rgbN ? all.subarray(textN + attnN) : null
+		};
+	}
+
+	/** Decode the current latent with TAEF2 into this.taef2.texture. */
+	async decode() {
+		// unpatchify: token (h, w), channel 4c + 2dy + dx -> latent pixel (2h + dy, 2w + dx) of channel c
+		const lat = await this.read(this.at.lat, NI * CIN);
+		const z = new Float32Array(32 * 64 * 64);
+		for (let h = 0; h < 32; h++)
+			for (let w = 0; w < 32; w++)
+				for (let c = 0; c < 32; c++)
+					for (let dy = 0; dy < 2; dy++)
+						for (let dx = 0; dx < 2; dx++)
+							z[(c * 64 + 2 * h + dy) * 64 + 2 * w + dx] =
+								lat[(h * 32 + w) * CIN + 4 * c + 2 * dy + dx];
+		this.taef2.writeLatent(z);
+		const enc = this.device.createCommandEncoder();
+		this.taef2.decode(enc);
+		this.device.queue.submit([enc.finish()]);
+		await this.device.queue.onSubmittedWorkDone();
+	}
+
+	async read(offset: number, count: number): Promise<Float32Array> {
+		const buf = this.device.createBuffer({
+			size: count * 4,
+			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+		});
+		const enc = this.device.createCommandEncoder();
+		enc.copyBufferToBuffer(this.arena, offset * 4, buf, 0, count * 4);
+		this.device.queue.submit([enc.finish()]);
+		await buf.mapAsync(GPUMapMode.READ);
+		const out = new Float32Array(buf.getMappedRange().slice(0));
+		buf.destroy();
+		return out;
+	}
+}
