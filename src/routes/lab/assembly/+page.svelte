@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { asset } from '$app/paths';
+	import { readerUrl } from '$lib/models';
 	import { initGPU } from '$lib/engine/gpu';
 	import { ensureFonts } from '$lib/engine/text';
 	import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
@@ -19,11 +19,7 @@
 			const gpu = await initGPU(canvas);
 			loading = 'Loading Ternary Bonsai 1.7B (460 MB)';
 			const [llm] = await Promise.all([
-				BonsaiLLM.load(
-					gpu.device,
-					asset('/models/ternary-bonsai-1.7b/model.gguf'),
-					(f) => (progress = f)
-				),
+				BonsaiLLM.load(gpu.device, readerUrl(), (f) => (progress = f)),
 				ensureFonts()
 			]);
 			if (!alive) return;

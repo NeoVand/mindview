@@ -18,11 +18,12 @@
 	<a
 		href={resolve('/lab')}
 		class="home"
-		aria-current={page.url.pathname === '/lab' ? 'page' : undefined}>Labs</a
+		aria-current={page.url.pathname === resolve('/lab') ? 'page' : undefined}>Labs</a
 	>
 	{#each labs as lab (lab.href)}
-		<a href={resolve(lab.href)} aria-current={page.url.pathname === lab.href ? 'page' : undefined}
-			>{lab.name}</a
+		<a
+			href={resolve(lab.href)}
+			aria-current={page.url.pathname === resolve(lab.href) ? 'page' : undefined}>{lab.name}</a
 		>
 	{/each}
 </nav>

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { asset } from '$app/paths';
+	import { painterUrl, readerUrl } from '$lib/models';
 	import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
 	import { Painter } from '$lib/runtime/painter';
 	import { PainterFiles } from '$lib/runtime/painter-files';
@@ -43,8 +44,8 @@
 			const ref = await (await fetch(asset('/lab/painter_ref/ref.json'))).json();
 			let t0 = performance.now();
 			const [llm, painter] = await Promise.all([
-				BonsaiLLM.load(dev, asset('/models/ternary-bonsai-1.7b/model.gguf')),
-				Painter.load(dev, asset('/models/bonsai-image-4b'))
+				BonsaiLLM.load(dev, readerUrl()),
+				Painter.load(dev, painterUrl())
 			]);
 			say(`loaded the 1.7B and the painter in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
 			if (import.meta.env.DEV) Object.assign(window, { painter, llm, dev });
@@ -123,7 +124,7 @@
 		busy = true;
 		try {
 			const dev = await device();
-			const files = await PainterFiles.open(asset('/models/bonsai-image-4b'));
+			const files = await PainterFiles.open(painterUrl());
 			await files.fetch(['taef2.bin']);
 			const weights = new Map(files.names('taef2.').map((k) => [k.slice(6), files.dense(k)]));
 			const tae = new Taef2(dev, weights, 512);

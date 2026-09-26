@@ -1,6 +1,6 @@
 // One graphics device and one copy of the reader for every lab: moving from one lab to another keeps them, so a
 // switch costs a new canvas, not a new download (the model stays on the GPU).
-import { asset } from '$app/paths';
+import { painterUrl, readerUrl } from '$lib/models';
 import { type GPU } from '$lib/engine/gpu';
 import { ensureFonts } from '$lib/engine/text';
 import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
@@ -65,9 +65,7 @@ export async function labModel(
 	if (onProgress) listeners.add(onProgress);
 	try {
 		llm ??= Promise.all([
-			BonsaiLLM.load(dev, asset('/models/ternary-bonsai-1.7b/model.gguf'), (f) =>
-				listeners.forEach((l) => l(f))
-			),
+			BonsaiLLM.load(dev, readerUrl(), (f) => listeners.forEach((l) => l(f))),
 			ensureFonts()
 		])
 			.then(([m]) => m)
@@ -88,12 +86,12 @@ export async function labPainter(
 ): Promise<Painter> {
 	if (onProgress) painterListeners.add(onProgress);
 	try {
-		painter ??= Painter.load(dev, asset('/models/bonsai-image-4b'), (p) =>
-			painterListeners.forEach((l) => l(p))
-		).catch((e) => {
-			painter = undefined;
-			throw e;
-		});
+		painter ??= Painter.load(dev, painterUrl(), (p) => painterListeners.forEach((l) => l(p))).catch(
+			(e) => {
+				painter = undefined;
+				throw e;
+			}
+		);
 		return await painter;
 	} finally {
 		if (onProgress) painterListeners.delete(onProgress);

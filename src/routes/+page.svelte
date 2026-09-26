@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { asset } from '$app/paths';
+	import { asset, resolve } from '$app/paths';
 	import { Engine, type EngineStatus } from '$lib/engine';
 
 	let engine: Engine | undefined;
@@ -69,6 +69,7 @@
 
 <main class:ready>
 	<canvas {@attach mountEngine} aria-label="The model computing, drawn as light"></canvas>
+	<a class="labs" href={resolve('/lab')}>The labs: the models live, every number</a>
 
 	{#if error}
 		<p class="error" role="alert">{error}</p>
@@ -180,6 +181,25 @@
 		background: var(--ember);
 		transform-origin: left;
 		transition: transform 0.2s linear;
+	}
+
+	.labs {
+		position: absolute;
+		top: 1.1rem;
+		right: 1.4rem;
+		z-index: 2;
+		font-size: 0.82rem;
+		letter-spacing: 0.01em;
+		color: var(--bone);
+		opacity: 0.55;
+		text-decoration: none;
+		border-bottom: 1px solid transparent;
+	}
+	.labs:hover,
+	.labs:focus-visible {
+		opacity: 1;
+		border-bottom-color: var(--ember);
+		outline: none;
 	}
 
 	.error {

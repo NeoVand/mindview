@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { asset } from '$app/paths';
+	import { readerUrl } from '$lib/models';
 	import { BonsaiLLM, MAX_TOKENS } from '$lib/runtime/bonsai-llm';
 	import { chatPrompt } from '$lib/runtime/tokenizer';
 
@@ -44,16 +45,12 @@
 			});
 			const t0 = performance.now();
 			let last = 0;
-			const model = await BonsaiLLM.load(
-				device,
-				asset('/models/ternary-bonsai-1.7b/model.gguf'),
-				(f) => {
-					if (f - last > 0.1) {
-						say(`downloading ${(f * 100).toFixed(0)}%`);
-						last = f;
-					}
+			const model = await BonsaiLLM.load(device, readerUrl(), (f) => {
+				if (f - last > 0.1) {
+					say(`downloading ${(f * 100).toFixed(0)}%`);
+					last = f;
 				}
-			);
+			});
 			say(
 				`loaded in ${((performance.now() - t0) / 1000).toFixed(1)}s: ${JSON.stringify(model.config)}`
 			);
