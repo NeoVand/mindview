@@ -120,8 +120,8 @@ export class PackedModel {
 	}
 
 	/**
-	 * The reader's tensors as a GGUF of their own (unwrapped, in one buffer), with the tokenizer put back into its
-	 * metadata, to load as the Qwen3 it is.
+	 * The reader's tensors as a GGUF of their own (unwrapped, in one buffer), with the tokenizer (and its chat template)
+	 * put back into its metadata, to load as the Qwen3 it is.
 	 */
 	async readerGGUF(onProgress?: (fraction: number) => void): Promise<GGUF> {
 		const ts = this.tensors('reader');
@@ -134,7 +134,8 @@ export class PackedModel {
 				t,
 				await PackedModel.payload(t, new Uint8Array(buf, t.offset - start, this.bytes(t)))
 			]);
-		const meta = { ...this.meta };
+		// the file as a whole is mindview-t2i; this part of it is a Qwen3 (its settings are the qwen3.* keys)
+		const meta = { ...this.meta, 'general.architecture': 'qwen3' };
 		const size = parts.reduce((a, [, p]) => a + Math.ceil(p.data.length / 32) * 32, 0);
 		const out = new Uint8Array(size);
 		const tensors = new Map<string, GGUFTensor>();

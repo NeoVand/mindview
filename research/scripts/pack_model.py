@@ -234,7 +234,9 @@ def main():
 
     # ---- the reader: metadata and tokenizer as they are, the layers up to the last tap
     r = Reader(READER)
-    w.meta('general.architecture', 8, 'qwen3')  # the reader part loads as the Qwen3 it is
+    # not 'qwen3': the file is not a Qwen3 model (GGUF tools and the Hub take the architecture at its word). The reader's
+    # settings keep their qwen3.* keys, and the runtime loads that part as the Qwen3 it is.
+    w.meta('general.architecture', 8, 'mindview-t2i')
     w.string('general.name', 'mindview-t2i')
     w.string(
         'general.description',
@@ -248,6 +250,8 @@ def main():
     for k, (t, v) in r.kv.items():
         if k in ('tokenizer.ggml.tokens', 'tokenizer.ggml.merges', 'tokenizer.ggml.token_type'):
             blob[k] = v[1]  # into the deflated blob below
+        elif k == 'tokenizer.chat_template':
+            blob[k] = v  # the prompt goes through it, but at the top level it would advertise a chat model
         elif k.startswith(('qwen3.', 'tokenizer.')):
             w.meta(k, t, layers if k == 'qwen3.block_count' else v)
     tok_json = json.dumps(blob).encode('utf-8')
