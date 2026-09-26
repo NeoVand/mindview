@@ -2,13 +2,15 @@
 // Bonsai 1.7B through the ternary adapter, 4 flow-matching Euler steps at 512 x 512, decoded by TAEF2.
 // Follows research/PAINTER-SPEC.md and research/scripts/painter_reference.py op by op:
 //   text:  taps h7|h14|h21 of the 1.7B over 512 tokens -> adapter (ternary 6144 -> 7680, + bias; rows 0..2 fixed)
+//          (in the one-file model, mindview-t2i, the adapter and W_ctx are one map, 6144 -> 3072: see fromPacked)
 //   DiT:   x = lat W_x^T, c = ctx W_ctx^T; 5 double blocks (text and image weights, joint attention), then 20 single
 //          blocks over the joint sequence (text first); velocity = (LN(h_img)(1 + scale) + shift) W_out^T
 //   step:  lat += (sigma_{s+1} - sigma_s) v
 // Everything is f32 on the GPU; ternary matrices use the tiled ternary GEMM, dense ones a strided batched GEMM.
 import type { BonsaiLLM } from './bonsai-llm';
 import { fetchModelFile, fetchModelJson } from './cache';
-import { halfToFloat } from './gguf';
+import { halfToFloat, unpackTrits, GGML_TRIT5, type GGUFTensor } from './gguf';
+import { PackedModel } from './packed';
 import { TernaryGemm, type GemmJob } from './gemm';
 import { PainterFiles } from './painter-files';
 import { gemmMs, type GpuTask } from './scheduler';
@@ -182,6 +184,14 @@ fn attn_pool(@builtin(global_invocation_id) g: vec3u) {
 }
 
 // Euler step: lat += fa * vel.  a=count, b=lat, c=vel
+// copy floats within the activations: a=count, b=from, c=to
+@compute @workgroup_size(256)
+fn copy_rows(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x + g.y * 65535u * 256u;
+  if (i >= U.a) { return; }
+  A[U.c + i] = A[U.b + i];
+}
+
 @compute @workgroup_size(256)
 fn euler(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= U.a) { return; }
@@ -252,7 +262,8 @@ type Kernel =
 	| 'attn_words'
 	| 'row_mean'
 	| 'row_project'
-	| 'attn_pool';
+	| 'attn_pool'
+	| 'copy_rows';
 type Op =
 	| { k: 'kernel'; name: Kernel; p: number[]; f?: number[]; wg: [number, number, number] }
 	| { k: 'gemm'; job: GemmJob }
@@ -364,6 +375,13 @@ export interface PainterProgress {
 	fraction: number;
 }
 
+/** Where the painter reads its settings and constants: its own files (PainterFiles) or the one-file model. */
+export interface PainterSource {
+	manifest: PainterFiles['manifest'];
+	dense(name: string): Float32Array;
+	names(prefix: string): string[];
+}
+
 /** Called after every block of every step with where things stand (for the visuals). */
 export type BlockHook = (step: number, block: number) => void | Promise<void>;
 
@@ -400,10 +418,13 @@ export class Painter {
 		data: Float32Array;
 	};
 	readonly manifest: PainterFiles['manifest'];
+	/** The adapter and the context embedder are one map (the one-file model): text rows are made once per prompt. */
+	readonly fused: boolean;
+	private ctxInit?: Float32Array;
 
 	private constructor(
 		private device: GPUDevice,
-		files: PainterFiles,
+		files: PainterSource,
 		codes: GPUBuffer,
 		scales: GPUBuffer,
 		dense: GPUBuffer,
@@ -426,6 +447,7 @@ export class Painter {
 			['vel', NI * CIN],
 			['taps', NT * TAP],
 			['ctx', NT * CTX],
+			['ctxd', NT * D], // the text rows of the stream, as the fused map makes them (fused only)
 			['h', NJ * D],
 			['n1', NJ * D],
 			['q', NJ * D],
@@ -468,8 +490,20 @@ export class Painter {
 			row.set(mods[3].subarray(s * 2 * D, (s + 1) * 2 * D), 15 * D);
 			device.queue.writeBuffer(this.arena, (at.mod + s * 17 * D) * 4, row);
 		}
-		device.queue.writeBuffer(this.arena, at.abias * 4, files.dense('adapter.bias'));
-		device.queue.writeBuffer(this.arena, at.ctx * 4, files.dense('adapter.prefix'));
+		this.fused = denseAt.has('cond.weight') || tern.has('cond.weight');
+		if (this.fused) {
+			// rows 0..2: the fixed prefix; rows 3..: the bias, to which the map adds each row's taps
+			const init = new Float32Array(NT * D);
+			init.set(files.dense('cond.prefix'), 0);
+			const bias = files.dense('cond.bias');
+			for (let r = 3; r < NT; r++) init.set(bias, r * D);
+			this.ctxInit = init;
+			// a ternary map adds its bias in the GEMM's epilogue
+			if (tern.has('cond.weight')) device.queue.writeBuffer(this.arena, at.abias * 4, bias);
+		} else {
+			device.queue.writeBuffer(this.arena, at.abias * 4, files.dense('adapter.bias'));
+			device.queue.writeBuffer(this.arena, at.ctx * 4, files.dense('adapter.prefix'));
+		}
 
 		this.gemm = new TernaryGemm(device, codes, scales, this.arena, 1024);
 		const module = device.createShaderModule({ label: 'painter', code: WGSL });
@@ -496,7 +530,8 @@ export class Painter {
 			'attn_words',
 			'row_mean',
 			'row_project',
-			'attn_pool'
+			'attn_pool',
+			'copy_rows'
 		];
 		this.pipes = Object.fromEntries(
 			names.map((e) => [
@@ -642,6 +677,83 @@ export class Painter {
 		return painter;
 	}
 
+	/**
+	 * The painter from the one-file model (see packed.ts): the fused conditioning map, the DiT and TAEF2, read in parts
+	 * and put on the GPU as they arrive (the ternary weights unpacked from trits).
+	 */
+	static async fromPacked(
+		device: GPUDevice,
+		model: PackedModel,
+		onProgress?: (p: PainterProgress) => void
+	): Promise<Painter> {
+		const ts = model.tensors('painter');
+		// a ternary tensor is the one with a `.scale` beside it (its stored type may be a deflate wrapper)
+		const isTernary = (t: GGUFTensor) => model.tensor(t.name + '.scale') !== undefined;
+		const isScale = (t: GGUFTensor) =>
+			t.name.endsWith('.scale') && model.tensor(t.name.slice(0, -6)) !== undefined;
+		// kept on the CPU (the constructor reads them): the step modulation, the decoder, the fixed text rows
+		const onCpu = (k: string) =>
+			k.startsWith('taef2.') ||
+			k.startsWith('mod.') ||
+			k === 'temb' ||
+			k.startsWith('cond.b') ||
+			k === 'cond.prefix';
+		const tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
+		const denseAt = new Map<string, number>();
+		let nc = 0,
+			ns = 0,
+			nd = 0;
+		for (const t of ts) {
+			if (isTernary(t)) {
+				const [K, M] = t.dims;
+				tern.set(t.name, { rows: M, cols: K, codes: nc, scales: ns });
+				nc += (M * K) / 16;
+				ns += (M * K) / 128;
+			} else if (!isScale(t) && !onCpu(t.name)) {
+				denseAt.set(t.name, nd);
+				nd += PackedModel.count(t);
+			}
+		}
+		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+		const codes = device.createBuffer({ label: 'painter codes', size: nc * 4, usage });
+		const scales = device.createBuffer({ label: 'painter scales', size: ns * 4, usage });
+		const dense = device.createBuffer({ label: 'painter dense', size: nd * 4, usage });
+		const kept = new Map<string, Float32Array>();
+		await model.read(
+			ts,
+			(part) => {
+				for (const [name, p] of part) {
+					const t = model.tensor(name)!;
+					if (p.type === GGML_TRIT5) {
+						const where = tern.get(name)!;
+						const n = where.rows * where.cols;
+						const words = new Uint32Array(n / 16);
+						unpackTrits(p.data, n, words, 0);
+						device.queue.writeBuffer(codes, where.codes * 4, words);
+						const sc = part.get(name + '.scale')!;
+						device.queue.writeBuffer(scales, where.scales * 4, PackedModel.floats(sc, name));
+					} else if (!isScale(t)) {
+						const v = PackedModel.floats(p, name);
+						if (onCpu(name)) kept.set(name, v);
+						else device.queue.writeBuffer(dense, denseAt.get(name)! * 4, v);
+					}
+				}
+			},
+			(f) => onProgress?.({ stage: 'Downloading the painter', fraction: f })
+		);
+		onProgress?.({ stage: 'Ready', fraction: 1 });
+		const source: PainterSource = {
+			manifest: { ...model.painterConfig, tensors: {} } as PainterSource['manifest'],
+			dense: (name) => {
+				const v = kept.get(name);
+				if (!v) throw new Error(`The model has no ${name}.`);
+				return v;
+			},
+			names: (prefix) => [...kept.keys()].filter((k) => k.startsWith(prefix))
+		};
+		return new Painter(device, source, codes, scales, dense, tern, denseAt, new Map());
+	}
+
 	private t(name: string) {
 		const t = this.tern.get(name);
 		if (!t) throw new Error(`The painter has no ternary ${name}.`);
@@ -654,6 +766,17 @@ export class Painter {
 		return o;
 	}
 
+	/** Free the painter's GPU memory (it cannot be used afterwards). */
+	destroy() {
+		for (const b of [this.arena, this.codesBuf, this.scalesBuf, this.dense, this.params])
+			b.destroy();
+	}
+
+	/** The reader's layers whose states are the conditioning (7, 14, 21 unless the model says otherwise). */
+	get taps(): number[] {
+		return (this.manifest.text as { taps?: number[] }).taps ?? [7, 14, 21];
+	}
+
 	/** Text side: the 1.7B reads the prompt padded to 512 tokens; its layers 7, 14, 21 become the conditioning. */
 	async encode(llm: BonsaiLLM, prompt: string) {
 		const text = (this.manifest.text as { template: string }).template
@@ -664,29 +787,14 @@ export class Painter {
 		const ids = real.concat(
 			new Array(NT - n).fill((this.manifest.text as { pad_id: number }).pad_id)
 		);
-		const taps = await llm.encodeLong(ids, [7, 14, 21], n);
+		const taps = await llm.encodeLong(ids, this.taps, n);
 		const rows = new Float32Array(NT * TAP);
 		for (let t = 0; t < NT; t++)
 			for (let k = 0; k < 3; k++)
 				rows.set(taps[k].subarray(t * 2048, (t + 1) * 2048), t * TAP + k * 2048);
 		this.device.queue.writeBuffer(this.arena, this.at.taps * 4, rows);
-		// adapter: rows 3.. only (the first three rows are the fixed prefix, already in place)
-		const a = this.t('adapter.weight');
-		this.run([
-			{
-				k: 'gemm',
-				job: {
-					M: NT - 3,
-					N: CTX,
-					K: TAP,
-					codes: a.codes,
-					scales: a.scales,
-					x: this.at.taps + 3 * TAP,
-					y: this.at.ctx + 3 * CTX,
-					bias: this.at.abias
-				}
-			}
-		]);
+		if (this.fused) this.device.queue.writeBuffer(this.arena, this.at.ctxd * 4, this.ctxInit!);
+		this.run([this.condOp()]);
 		await this.device.queue.onSubmittedWorkDone();
 		return { ids, real: n };
 	}
@@ -792,12 +900,29 @@ export class Painter {
 				[D / 64, NI / 64, 1],
 				[1]
 			);
-			K(
-				'dgemm',
-				[NT, D, CTX, at.ctx, CTX, 0, this.w('context_embedder.weight'), CTX, 0, at.h + T0, D, 0, 1],
-				[D / 64, NT / 64, 1],
-				[1]
-			);
+			if (this.fused)
+				K('copy_rows', [NT * D, at.ctxd, at.h + T0], [Math.ceil((NT * D) / 256), 1, 1]);
+			else
+				K(
+					'dgemm',
+					[
+						NT,
+						D,
+						CTX,
+						at.ctx,
+						CTX,
+						0,
+						this.w('context_embedder.weight'),
+						CTX,
+						0,
+						at.h + T0,
+						D,
+						0,
+						1
+					],
+					[D / 64, NT / 64, 1],
+					[1]
+				);
 		}
 		hooks.push([ops.length, -1]);
 		for (let b = 0; b < 5; b++) {
@@ -989,7 +1114,7 @@ export class Painter {
 		const ids = real.concat(
 			new Array(NT - n).fill((this.manifest.text as { pad_id: number }).pad_id)
 		);
-		const tasks = llm.encodeLongTasks(ids, [7, 14, 21], n, budget);
+		const tasks = llm.encodeLongTasks(ids, this.taps, n, budget);
 		// taps [3][512][2048] in the reader -> [512][h7 | h14 | h21] here, then the adapter (rows 3.. only)
 		tasks.push({
 			cost: 1,
@@ -1005,28 +1130,72 @@ export class Painter {
 						);
 			}
 		});
-		const a = this.t('adapter.weight');
-		tasks.push(
-			...this.tasks(
-				[
-					{
-						k: 'gemm',
-						job: {
-							M: NT - 3,
-							N: CTX,
-							K: TAP,
-							codes: a.codes,
-							scales: a.scales,
-							x: this.at.taps + 3 * TAP,
-							y: this.at.ctx + 3 * CTX,
-							bias: this.at.abias
-						}
-					}
-				],
-				budget
-			)
-		);
+		if (this.fused)
+			tasks.push({
+				cost: 0.5,
+				record: () => this.device.queue.writeBuffer(this.arena, this.at.ctxd * 4, this.ctxInit!)
+			});
+		tasks.push(...this.tasks([this.condOp()], budget));
 		return { tasks, real: n };
+	}
+
+	/**
+	 * The conditioning from the taps, rows 3.. (rows 0..2 are the fixed prefix, already in place): the ternary adapter
+	 * into ctx (7,680 wide, embedded each step), or the fused map straight into ctxd (3,072 wide, added to the bias).
+	 */
+	private condOp(): Op {
+		if (this.fused && this.tern.has('cond.weight')) {
+			const c = this.t('cond.weight');
+			return {
+				k: 'gemm',
+				job: {
+					M: NT - 3,
+					N: D,
+					K: TAP,
+					codes: c.codes,
+					scales: c.scales,
+					x: this.at.taps + 3 * TAP,
+					y: this.at.ctxd + 3 * D,
+					bias: this.at.abias
+				}
+			};
+		}
+		if (this.fused)
+			return {
+				k: 'kernel',
+				name: 'dgemm',
+				p: [
+					NT - 3,
+					D,
+					TAP,
+					this.at.taps + 3 * TAP,
+					TAP,
+					0,
+					this.w('cond.weight'),
+					TAP,
+					0,
+					this.at.ctxd + 3 * D,
+					D,
+					0,
+					1 | 4
+				],
+				f: [1],
+				wg: [D / 64, Math.ceil((NT - 3) / 64), 1]
+			};
+		const a = this.t('adapter.weight');
+		return {
+			k: 'gemm',
+			job: {
+				M: NT - 3,
+				N: CTX,
+				K: TAP,
+				codes: a.codes,
+				scales: a.scales,
+				x: this.at.taps + 3 * TAP,
+				y: this.at.ctx + 3 * CTX,
+				bias: this.at.abias
+			}
+		};
 	}
 
 	/**
@@ -1602,10 +1771,17 @@ export class Painter {
 		};
 	}
 
-	/** Decode the current latent with TAEF2 into this.taef2.texture. */
-	async decode() {
+	/**
+	 * Decode with TAEF2 into this.taef2.texture: the current latent, or with sigma > 0 the picture the painter has in
+	 * mind after a step (x0 = latent - sigma x velocity, sigma the step's new noise level).
+	 */
+	async decode(sigma = 0) {
 		// unpatchify: token (h, w), channel 4c + 2dy + dx -> latent pixel (2h + dy, 2w + dx) of channel c
 		const lat = await this.read(this.at.lat, NI * CIN);
+		if (sigma > 0) {
+			const vel = await this.read(this.at.vel, NI * CIN);
+			for (let i = 0; i < lat.length; i++) lat[i] -= sigma * vel[i];
+		}
 		const z = new Float32Array(32 * 64 * 64);
 		for (let h = 0; h < 32; h++)
 			for (let w = 0; w < 32; w++)

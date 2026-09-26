@@ -46,6 +46,12 @@ function makeDevice(): Promise<GPUDevice> {
 	})();
 }
 
+/** The shared device (for pages that draw with it only through copies). */
+export async function labDevice(): Promise<GPUDevice> {
+	device ??= makeDevice();
+	return device;
+}
+
 /** The shared device, with this canvas set up to show it. */
 export async function labGPU(canvas: HTMLCanvasElement): Promise<GPU> {
 	device ??= makeDevice();

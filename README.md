@@ -4,7 +4,7 @@ Two ternary neural networks, one reading a prompt and one painting it, shown whi
 your browser with WebGPU, and every number on screen is one the models just computed in that tab.
 
 **Live:** [neovand.github.io/mindview](https://neovand.github.io/mindview/) ·
-[the labs](https://neovand.github.io/mindview/lab)
+[the labs](https://neovand.github.io/mindview/lab) · [paint](https://neovand.github.io/mindview/paint)
 
 ![The painter's attention: each of 24 heads' shares over the picture, for one patch of the trunk](docs/where-it-looks.png)
 
@@ -26,10 +26,44 @@ by their weights: each weight adds its input, subtracts it or skips it.
 After every block, a per-block lens (a small readout fitted with `research/scripts/tuned_lens.py`) shows the
 picture the painter has in mind at that point.
 
+## One file, under a gigabyte
+
+The labs run the whole pipeline above, because they show all of it. Painting alone needs less.
+[mindview-t2i](https://huggingface.co/mohsenvand/mindview-t2i) is the same kind of pipeline packed into one file of
+957.5 MB, and [`/paint`](https://neovand.github.io/mindview/paint) runs it: type a prompt, get a picture.
+
+- **The reader keeps 9 of its 28 layers.** A sweep over which reader layers to tap
+  (`research/scripts/adapter_layers.py`) found that shallow layers condition the painter about as well as deep ones.
+  The map from layers 3, 6 and 9 scores a per-token cosine of 0.959 against the stock encoder, measured in the
+  painter's input space on held-out prompts. The site's adapter, which reads layers 7, 14 and 21, scores 0.952.
+  Every layer the map does not read is a layer the file does not carry.
+- **The map and the painter's context embedder are one matrix** (6,144 → 3,072, f16), because both are linear.
+- **Ternary weights are stored 5 to a byte** (1.6 bits each). Tensors are deflated wherever that saves anything, and
+  the browser inflates them. The file is read with range requests, in parts, so it is never all in memory at once.
+
+| Part                               | Stored   |
+| ---------------------------------- | -------- |
+| The reader: 9 layers and tokenizer | 158.4 MB |
+| The map                            | 35.3 MB  |
+| The painter                        | 761.3 MB |
+| The decoder                        | 2.5 MB   |
+
+To rebuild it (after `research/scripts/adapter.py targets`, which runs the stock encoder over the prompts):
+
+```sh
+research/.venv/bin/python research/scripts/adapter_layers.py stats
+research/.venv/bin/python research/scripts/adapter_layers.py fit
+research/.venv/bin/python research/scripts/adapter_layers.py final 3 6 9
+research/.venv/bin/python research/scripts/pack_model.py --fused research/data/adapter/fused_final_layers_3_6_9.pt --float
+```
+
+The pages `/lab/pack` and `/lab/pack/grid` compare the file's pictures with the reader's and painter's own files.
+
 ## What you can open
 
 | Page                                                             | What it is                                                                                                                                                                                                                                                                                                                                           |
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`/paint`](https://neovand.github.io/mindview/paint)             | Type a prompt and get a picture, from the one-file model.                                                                                                                                                                                                                                                                                            |
 | [`/`](https://neovand.github.io/mindview/)                       | The first piece: a recorded run of one prompt, replayed as light.                                                                                                                                                                                                                                                                                    |
 | [`/lab/threads`](https://neovand.github.io/mindview/lab/threads) | Each word is a thread through the reader's layers, then into the painter as it paints, block by block, with where the picture looks at each word.                                                                                                                                                                                                    |
 | [`/lab/layer`](https://neovand.github.io/mindview/lab/layer)     | Operation by operation, every number readable. Pick one layer of the reader, or one block of the painter (for a word or a patch of the picture). You see the norms, the projections with their running sums, the rotary turns, attention (in the painter, 24 heads over the prompt and all 1,024 patches), the neurons, and the gated residual adds. |
@@ -42,7 +76,8 @@ You need:
 
 - A browser with WebGPU: a recent Chrome or Edge. It is developed and tested in Chrome on an Apple M4.
 - A GPU with about 3 GB to spare.
-- Room for about 1.6 GB of downloads on the first visit. The browser keeps them in Cache Storage for later visits.
+- Room for about 1.6 GB of downloads on the first visit to the labs, or 0.96 GB for `/paint`. The browser keeps them
+  in Cache Storage for later visits.
 
 To run it locally:
 
@@ -59,6 +94,9 @@ hf download prism-ml/Ternary-Bonsai-1.7B-gguf Ternary-Bonsai-1.7B-Q2_0.gguf --lo
 mkdir -p static/models/ternary-bonsai-1.7b
 mv /tmp/reader/Ternary-Bonsai-1.7B-Q2_0.gguf static/models/ternary-bonsai-1.7b/model.gguf
 hf download mohsenvand/mindview-painter --local-dir static/models/bonsai-image-4b
+hf download mohsenvand/mindview-t2i mindview-t2i.gguf --local-dir /tmp/t2i
+mkdir -p static/models/mindview-t2i
+mv /tmp/t2i/mindview-t2i.gguf static/models/mindview-t2i/model.gguf
 ```
 
 `MODELS=hub` or `MODELS=local` forces one or the other (see `vite.config.ts` and `src/lib/models.ts`).
@@ -81,6 +119,7 @@ Other commands:
 - `research/`: the Python side, which:
   - exports the painter's files (`export_painter.py`, `export_painter_schedules.py`, `export_painter_viz2.py`);
   - trains the adapter (`adapter.py`, `adapter_ternarize.py`);
+  - fits the map for the one-file model and packs it (`adapter_layers.py`, `pack_model.py`);
   - fits the lens (`tuned_lens.py`);
   - checks the browser runtime against PyTorch (`painter_reference.py`, `painter_truth.py`).
 
@@ -100,3 +139,5 @@ Other commands:
 - [Ollin Boer Bohan](https://huggingface.co/madebyollin/taef2): TAEF2 (MIT).
 - The painter bundle on Hugging Face ([mohsenvand/mindview-painter](https://huggingface.co/mohsenvand/mindview-painter))
   repackages those weights for the browser, together with the adapter and the lens trained here.
+  [mohsenvand/mindview-t2i](https://huggingface.co/mohsenvand/mindview-t2i) packs them, with the map trained here,
+  into one file.

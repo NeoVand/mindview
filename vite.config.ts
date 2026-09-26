@@ -11,11 +11,18 @@ const localModels = process.env.MODELS
 	? process.env.MODELS === 'local'
 	: existsSync('static/models/ternary-bonsai-1.7b/model.gguf') &&
 		existsSync('static/models/bonsai-image-4b/manifest.json');
+// the one-file model (/paint) on its own: it is there only if you downloaded or packed it
+const localPacked = process.env.MODELS
+	? process.env.MODELS === 'local'
+	: existsSync('static/models/mindview-t2i/model.gguf');
 // Served from a folder (GitHub Pages serves a project's site at /<repository>): BASE_PATH=/mindview
 const base = (process.env.BASE_PATH ?? '') as '' | `/${string}`;
 
 export default defineConfig({
-	define: { __LOCAL_MODELS__: JSON.stringify(localModels) },
+	define: {
+		__LOCAL_MODELS__: JSON.stringify(localModels),
+		__LOCAL_PACKED__: JSON.stringify(localPacked)
+	},
 	plugins: [
 		tailwindcss(),
 		sveltekit({

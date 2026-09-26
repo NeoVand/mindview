@@ -7,7 +7,11 @@ import {
 	GGML_Q2_0_G128_LEGACY,
 	halfToFloat,
 	parseGGUF,
-	type GGUF
+	type GGUF,
+	GGML_F16,
+	GGML_TRIT5,
+	unpackTrits,
+	type GGUFTensor
 } from './gguf';
 import { fetchModelFile } from './cache';
 import { TernaryGemm, type GemmJob } from './gemm';
@@ -351,8 +355,14 @@ export class BonsaiLLM {
 		let codeWords = 0,
 			scaleCount = 0,
 			normCount = 0;
+		// the scales of trit-packed tensors (GGML_TRIT5) sit beside them as <name>.scale
+		const isScale = (t: GGUFTensor) =>
+			t.type === GGML_F16 &&
+			t.name.endsWith('.scale') &&
+			gguf.tensors.get(t.name.slice(0, -6))?.type === GGML_TRIT5;
 		for (const t of gguf.tensors.values()) {
-			if (t.type === GGML_Q2_0_G128_LEGACY || t.type === GGML_PQ2_0) {
+			if (isScale(t)) continue;
+			if (t.type === GGML_Q2_0_G128_LEGACY || t.type === GGML_PQ2_0 || t.type === GGML_TRIT5) {
 				const [K, M] = t.dims;
 				this.tensors.set(t.name, {
 					rows: M,
@@ -390,11 +400,33 @@ export class BonsaiLLM {
 			mappedAtCreation: true
 		});
 		const codeBytes = new Uint8Array(this.codes.getMappedRange());
+		const codeU32 = new Uint32Array(codeBytes.buffer, codeBytes.byteOffset, codeBytes.length / 4);
 		const scaleF = new Float32Array(this.scales.getMappedRange());
 		const normF = new Float32Array(this.normw.getMappedRange());
 		const src = new Uint8Array(gguf.buffer);
 		const dv = new DataView(gguf.buffer);
 		for (const t of gguf.tensors.values()) {
+			if (isScale(t)) continue;
+			if (t.type === GGML_TRIT5) {
+				const info = this.tensors.get(t.name)!;
+				const n = info.rows * info.cols;
+				unpackTrits(
+					new Uint8Array(gguf.buffer, t.offset, Math.ceil(n / 80) * 16),
+					n,
+					codeU32,
+					info.codes
+				);
+				const st = gguf.tensors.get(t.name + '.scale')!;
+				const h = new Uint16Array(gguf.buffer.slice(st.offset, st.offset + (n / 128) * 2));
+				let sum = 0;
+				for (let i = 0; i < h.length; i++) {
+					const v = halfToFloat(h[i]);
+					scaleF[info.scales + i] = v;
+					sum += Math.abs(v);
+				}
+				info.meanScale = sum / h.length;
+				continue;
+			}
 			if (t.type === GGML_F32) {
 				const n = t.dims.reduce((a, b) => a * b, 1);
 				normF.set(
@@ -512,6 +544,27 @@ export class BonsaiLLM {
 	): Promise<BonsaiLLM> {
 		// kept on this computer after the first download
 		return new BonsaiLLM(device, parseGGUF(await fetchModelFile(url, onProgress)));
+	}
+
+	/** Free the reader's GPU memory (it cannot be used afterwards). */
+	destroy() {
+		for (const b of [
+			this.codes,
+			this.scales,
+			this.normw,
+			this.arena,
+			this.tokBuf,
+			this.invBuf,
+			this.params
+		])
+			b.destroy();
+		this.long?.arena.destroy();
+		this.long?.taps.destroy();
+	}
+
+	/** From a parsed GGUF already in memory (e.g. the reader part of the one-file model, see packed.ts). */
+	static fromGGUF(device: GPUDevice, gguf: GGUF): BonsaiLLM {
+		return new BonsaiLLM(device, gguf);
 	}
 
 	/** GPU buffers holding every ternary weight (for drawing the real weights) and where a tensor lives in them. */

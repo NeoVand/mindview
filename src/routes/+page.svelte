@@ -69,7 +69,10 @@
 
 <main class:ready>
 	<canvas {@attach mountEngine} aria-label="The model computing, drawn as light"></canvas>
-	<a class="labs" href={resolve('/lab')}>The labs: the models live, every number</a>
+	<nav class="elsewhere" aria-label="Elsewhere">
+		<a href={resolve('/paint')}>Paint with it</a>
+		<a href={resolve('/lab')}>The labs: the models live, every number</a>
+	</nav>
 
 	{#if error}
 		<p class="error" role="alert">{error}</p>
@@ -183,11 +186,15 @@
 		transition: transform 0.2s linear;
 	}
 
-	.labs {
+	.elsewhere {
 		position: absolute;
 		top: 1.1rem;
 		right: 1.4rem;
 		z-index: 2;
+		display: flex;
+		gap: 1.1rem;
+	}
+	.elsewhere a {
 		font-size: 0.82rem;
 		letter-spacing: 0.01em;
 		color: var(--bone);
@@ -195,8 +202,8 @@
 		text-decoration: none;
 		border-bottom: 1px solid transparent;
 	}
-	.labs:hover,
-	.labs:focus-visible {
+	.elsewhere a:hover,
+	.elsewhere a:focus-visible {
 		opacity: 1;
 		border-bottom-color: var(--ember);
 		outline: none;

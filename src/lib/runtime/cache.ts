@@ -70,3 +70,88 @@ export async function fetchModelFile(
 export async function fetchModelJson<T>(url: string): Promise<T> {
 	return JSON.parse(new TextDecoder().decode(await fetchModelFile(url))) as T;
 }
+
+/** A file's ETag (or last-modified) on the server, or '' offline. */
+async function tagOf(url: string): Promise<{ tag: string; online: boolean }> {
+	try {
+		const head = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+		if (!head.ok) throw new Error(`Could not find ${url} (${head.status}).`);
+		return {
+			tag: head.headers.get('etag') ?? head.headers.get('last-modified') ?? '',
+			online: true
+		};
+	} catch (e) {
+		if (e instanceof Error && e.message.startsWith('Could not find')) throw e;
+		return { tag: '', online: false };
+	}
+}
+
+/**
+ * Bytes [start, end) of the file at url (a range request), kept on this computer like whole files are, so a large file
+ * can be read in parts without ever holding all of it. `tag` is the file's tag from modelFileTag (checked once).
+ */
+export async function fetchModelRange(
+	url: string,
+	start: number,
+	end: number,
+	tag: { tag: string; online: boolean },
+	onProgress?: (fraction: number) => void
+): Promise<ArrayBuffer> {
+	const key = `${url}${url.includes('?') ? '&' : '?'}mindview-range=${start}-${end}`;
+	const cache = await open();
+	if (cache) {
+		const kept = await cache.match(key);
+		if (kept && (!tag.online || (tag.tag && kept.headers.get(TAG) === tag.tag))) {
+			const buf = await kept.arrayBuffer();
+			onProgress?.(1);
+			return buf;
+		}
+	}
+	const res = await fetch(url, {
+		cache: 'no-store',
+		headers: { Range: `bytes=${start}-${end - 1}` }
+	});
+	if (!res.ok || !res.body) throw new Error(`Could not download ${url} (${res.status}).`);
+	const total = end - start;
+	const buf = new Uint8Array(total);
+	const reader = res.body.getReader();
+	let got = 0;
+	if (res.status === 200) {
+		// the server sent the whole file: keep only the part asked for
+		let pos = 0;
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const a = Math.max(start, pos),
+				b = Math.min(end, pos + value.length);
+			if (b > a) buf.set(value.subarray(a - pos, b - pos), a - start);
+			pos += value.length;
+			got = Math.max(0, Math.min(total, pos - start));
+			onProgress?.(got / total);
+			if (pos >= end) {
+				await reader.cancel();
+				break;
+			}
+		}
+	} else {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buf.set(value, got);
+			got += value.length;
+			onProgress?.(got / total);
+		}
+	}
+	if (got !== total) throw new Error(`Downloaded ${got} of ${total} bytes of ${url}.`);
+	if (cache && tag.tag)
+		try {
+			await cache.put(key, new Response(buf, { headers: { [TAG]: tag.tag } }));
+		} catch {
+			// out of room: it will simply be downloaded again next time
+		}
+	onProgress?.(1);
+	return buf.buffer;
+}
+
+/** Look a model file up once (for fetchModelRange). */
+export const modelFileTag = tagOf;

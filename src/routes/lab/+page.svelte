@@ -48,6 +48,10 @@
 			</li>
 		{/each}
 	</ol>
+	<p class="lede coda">
+		The same pipeline, cut to what painting needs and packed into one file of under a gigabyte:
+		<a href={resolve('/paint')}>paint with it</a>.
+	</p>
 </main>
 
 <style>
@@ -71,6 +75,19 @@
 		font-weight: 300;
 		line-height: 1.5;
 		opacity: 0.7;
+	}
+	.coda {
+		margin: 3.5rem 0 0;
+	}
+	.coda a {
+		color: var(--ember);
+		text-decoration: none;
+		border-bottom: 1px solid transparent;
+	}
+	.coda a:hover,
+	.coda a:focus-visible {
+		border-bottom-color: var(--ember);
+		outline: none;
 	}
 	ol {
 		list-style: none;

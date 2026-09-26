@@ -19,6 +19,22 @@ export const GGML_F32 = 0;
 export const GGML_F16 = 1;
 export const GGML_Q2_0_G128_LEGACY = 42; // PrismML ternary g128 in 2-bit slots (older files)
 export const GGML_PQ2_0 = 142; // same block layout under its current id
+/** mindview's packing (research/scripts/pack_model.py): trits 5 to a byte, scales in `<name>.scale` (f16). */
+export const GGML_TRIT5 = 200;
+/** A deflated tensor: u32 inner type, u32 inflated bytes, u32 deflated bytes, u32 0, then raw deflate. */
+export const GGML_DEFLATE = 202;
+/** f16 values as two byte planes (every high byte, then every low byte). */
+export const GGML_F16_PLANES = 203;
+/** UTF-8 JSON (dims: its length in bytes). */
+export const GGML_JSON = 204;
+
+/** Inflate raw deflate (the browser's own decompressor). */
+export async function inflateRaw(bytes: Uint8Array): Promise<Uint8Array> {
+	const stream = new Blob([bytes as BlobPart])
+		.stream()
+		.pipeThrough(new DecompressionStream('deflate-raw'));
+	return new Uint8Array(await new Response(stream).arrayBuffer());
+}
 
 export function parseGGUF(buffer: ArrayBuffer): GGUF {
 	const dv = new DataView(buffer);
@@ -107,4 +123,53 @@ export function halfToFloat(h: number): number {
 	if (e === 0) return s * f * 2 ** -24;
 	if (e === 31) return f ? NaN : s * Infinity;
 	return s * (1 + f / 1024) * 2 ** (e - 15);
+}
+
+/** f16 values (as u16) to f32. */
+export function halvesToFloats(h: Uint16Array): Float32Array {
+	const out = new Float32Array(h.length);
+	for (let i = 0; i < h.length; i++) out[i] = halfToFloat(h[i]);
+	return out;
+}
+
+// each byte holds 5 trits (q = trit + 1, base 3, the first in the lowest digit): the 10 bits of their 2-bit codes
+const TRIT_CODES = (() => {
+	const t = new Uint16Array(243);
+	for (let b = 0; b < 243; b++) {
+		let v = b,
+			bits = 0;
+		for (let i = 0; i < 5; i++) {
+			bits |= (v % 3) << (2 * i);
+			v = Math.floor(v / 3);
+		}
+		t[b] = bits;
+	}
+	return t;
+})();
+
+/**
+ * Unpack `n` trits (GGML_TRIT5: 5 to a byte, in blocks of 16 bytes = 80 trits) into 2-bit codes, 16 to a u32 (the
+ * layout the GPU kernels read), from out[at] on.
+ */
+export function unpackTrits(bytes: Uint8Array, n: number, out: Uint32Array, at: number) {
+	const words = n / 16;
+	let w = at;
+	const end = at + words;
+	// 16 bytes -> 80 codes -> 5 words
+	for (let b = 0; w < end; b += 16) {
+		let acc = 0,
+			fill = 0;
+		for (let i = 0; i < 16 && w < end; i++) {
+			const c = TRIT_CODES[bytes[b + i]];
+			// 10 bits into the word being filled; what does not fit starts the next
+			acc |= c << fill;
+			fill += 10;
+			if (fill >= 32) {
+				out[w++] = acc >>> 0;
+				fill -= 32;
+				acc = fill > 0 ? c >>> (10 - fill) : 0;
+			}
+		}
+		if (fill > 0 && w < end) out[w++] = acc >>> 0;
+	}
 }
