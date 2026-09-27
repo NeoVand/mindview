@@ -30,7 +30,8 @@ picture the painter has in mind at that point.
 
 The labs run the whole pipeline above, because they show all of it. Painting alone needs less.
 [mindview-t2i](https://huggingface.co/mohsenvand/mindview-t2i) is the same kind of pipeline packed into one file of
-957.5 MB, and [`/paint`](https://neovand.github.io/mindview/paint) runs it: type a prompt, get a picture.
+980 MB, and [`/paint`](https://neovand.github.io/mindview/paint) runs it: type a prompt, get a picture. On a MacBook Air
+(M4) in Chrome a picture takes about 10 s in two steps (Fast) and 16 s in four (Best).
 
 - **The reader keeps 9 of its 28 layers.** A sweep over which reader layers to tap
   (`research/scripts/adapter_layers.py`) found that shallow layers condition the painter about as well as deep ones.
@@ -38,6 +39,10 @@ The labs run the whole pipeline above, because they show all of it. Painting alo
   painter's input space on held-out prompts. The site's adapter, which reads layers 7, 14 and 21, scores 0.952.
   Every layer the map does not read is a layer the file does not carry.
 - **The map and the painter's context embedder are one matrix** (6,144 → 3,072, f16), because both are linear.
+- **Two steps with a borrowed LoRA.** radames'
+  [SANA-Sprint LoRA](https://huggingface.co/radames/FLUX.2-klein-Sana-Sprint), trained on the original klein, carries
+  over to the ternary painter. Its best rank-8 approximation paints like the full rank 256 and costs 21 MB; it runs as a
+  side branch of each ternary matrix (`research/scripts/lora_steps.py`, `lora_compress.py`).
 - **Ternary weights are stored 5 to a byte** (1.6 bits each). Tensors are deflated wherever that saves anything, and
   the browser inflates them. The file is read with range requests, in parts, so it is never all in memory at once.
 
@@ -47,6 +52,8 @@ The labs run the whole pipeline above, because they show all of it. Painting alo
 | The map                            | 35.3 MB  |
 | The painter                        | 761.3 MB |
 | The decoder                        | 2.5 MB   |
+| The few-step LoRA (rank 8)         | 20.8 MB  |
+| Schedules for 1–4 steps            | 1.9 MB   |
 
 To rebuild it (after `research/scripts/adapter.py targets`, which runs the stock encoder over the prompts):
 
@@ -54,8 +61,13 @@ To rebuild it (after `research/scripts/adapter.py targets`, which runs the stock
 research/.venv/bin/python research/scripts/adapter_layers.py stats
 research/.venv/bin/python research/scripts/adapter_layers.py fit
 research/.venv/bin/python research/scripts/adapter_layers.py final 3 6 9
-research/.venv/bin/python research/scripts/pack_model.py --fused research/data/adapter/fused_final_layers_3_6_9.pt --float
+research/.venv/bin/python research/scripts/pack_model.py --fused research/data/adapter/fused_final_layers_3_6_9.pt --float \
+  --lora <radames/FLUX.2-klein-Sana-Sprint's pytorch_lora_weights.safetensors> --lora-rank 8
 ```
+
+What makes it fast in the browser: an f16 ternary GEMM (tiles staged and multiplied in f16, summed in f32), attention in
+f16, the text stream cut to what the prompt needs, and a register-tiled decoder. `/dev/gemm`, `/dev/profile` and
+`/dev/rows` (development only) measure them.
 
 The pages `/lab/pack` and `/lab/pack/grid` compare the file's pictures with the reader's and painter's own files.
 
