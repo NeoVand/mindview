@@ -340,7 +340,7 @@ export interface PainterLora {
 	at: Map<string, number>;
 	ranks: Partial<Record<Branch, number>>;
 }
-type Branch = 'lora' | 'rdm';
+type Branch = 'lora' | 'rdm' | 'best';
 /** A schedule: a step count, or '1r' (1 step with the `rdm` branch). */
 export type Schedule = number | '1r';
 
@@ -532,7 +532,10 @@ export class Painter {
 	set precision(p: 'f32' | 'f16') {
 		this.gemm.precision = p;
 	}
-	/** The side branch in use (setSteps): the few-step LoRA with 1 or 2 steps, RDM with '1r'; none otherwise. */
+	/**
+	 * The side branch in use (setSteps): the few-step LoRA (or the trained Fast branch) with 1 or 2 steps, RDM with
+	 * '1r', the trained Best branch with 4; none otherwise.
+	 */
 	private branch?: Branch;
 	get hasLora() {
 		return !!this.lora?.ranks.lora;
@@ -848,7 +851,7 @@ export class Painter {
 		// the GEMM's side branch runs in chunks of 32: a lower rank is padded with zero rows (buffers start zeroed)
 		const ranks: Partial<Record<Branch, number>> = {},
 			stored: Partial<Record<Branch, number>> = {};
-		for (const b of ['lora', 'rdm'] as const) {
+		for (const b of ['lora', 'rdm', 'best'] as const) {
 			const meta = model.meta[`mindview.${b}`];
 			if (!meta) continue;
 			stored[b] = (JSON.parse(String(meta)) as { rank: number }).rank;
@@ -2200,7 +2203,14 @@ export class Painter {
 	setSteps(n: Schedule) {
 		const sc = this.schedules?.meta[String(n)];
 		if (n === '1r' && !this.hasOneStep) throw new Error('The painter has no 1-step fine-tune.');
-		this.branch = n === '1r' ? 'rdm' : this.hasLora && n <= 2 ? 'lora' : undefined;
+		this.branch =
+			n === '1r'
+				? 'rdm'
+				: n === 4 && this.lora?.ranks.best
+					? 'best'
+					: this.hasLora && n <= 2
+						? 'lora'
+						: undefined;
 		if (!sc || !this.schedules) {
 			if (n !== 4) throw new Error(`The painter has no ${n}-step schedule.`);
 			return;

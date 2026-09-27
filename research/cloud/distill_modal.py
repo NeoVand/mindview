@@ -5,6 +5,7 @@
     modal run research/cloud/distill_modal.py --step targets --n 2000 --k 3   # 3 noises per prompt
     modal run research/cloud/distill_modal.py --step train --steps 3000 --rank 32 --batch 4
     modal run research/cloud/distill_modal.py --step pull       # checkpoint and held-out pictures, back here
+                                                  [--only fast_] # only the files whose names contain this
 
 Fast and Best (scripts/distill_steps.py): --script steps --mode fast|best with --step targets / train / pull.
 
@@ -57,7 +58,7 @@ def run(args: list[str], script: str = 'distill_1step.py'):
 
 @app.local_entrypoint()
 def main(step: str, n: int = 2000, k: int = 1, steps: int = 3000, rank: int = 32, batch: int = 4, lr: float = 5e-5,
-         script: str = '1step', mode: str = ''):
+         script: str = '1step', mode: str = '', only: str = ''):
     if script == 'steps' and step in ('targets', 'train'):
         args = ['targets', mode, str(n)] if step == 'targets' else ['train', mode, str(steps), str(rank), str(batch), str(lr)]
         run.remote(args, 'distill_steps.py')
@@ -76,10 +77,14 @@ def main(step: str, n: int = 2000, k: int = 1, steps: int = 3000, rank: int = 32
         out = RESEARCH / 'renders/distill_cloud'
         out.mkdir(parents=True, exist_ok=True)
         for e in vol.listdir('/work/renders/distill'):
+            if only and only not in e.path:
+                continue
             (out / pathlib.Path(e.path).name).write_bytes(b''.join(vol.read_file(e.path)))
         ck = RESEARCH / 'data/distill/cloud'
         ck.mkdir(parents=True, exist_ok=True)
         for e in vol.listdir('/work/data/distill'):
+            if only and only not in e.path:
+                continue
             if e.path.endswith('.pt') and ('student' in e.path or '_r' in pathlib.Path(e.path).name):
                 (ck / pathlib.Path(e.path).name).write_bytes(b''.join(vol.read_file(e.path)))
         print('pulled into', out, 'and', ck)

@@ -228,6 +228,11 @@ def main():
     ap.add_argument('--schedules', default='1,2,3,4', help="other step counts to carry (from the bundle's schedules)")
     ap.add_argument('--rdm', help="a 1-step side branch: rdm_delta.py's rank-256 SVD of RDM - klein (schedule '1r')")
     ap.add_argument('--rdm-rank', type=int, default=32, help="keep the 1-step change's best rank-r approximation")
+    ap.add_argument('--lora-note', help="what the LoRA is, if not the source's own (e.g. a branch trained here)")
+    ap.add_argument('--best', help='a 4-step side branch (distill_steps.py export best), on for 4 steps')
+    ap.add_argument('--best-rank', type=int, default=32)
+    ap.add_argument('--fast-offsets', help="distill_steps.py's fast_offsets.pt: added to schedule 2's modulation")
+    ap.add_argument('--best-offsets', help="distill_steps.py's best_offsets.pt: added to schedule 4's modulation")
     args = ap.parse_args()
     fused = None
     if args.fused:
@@ -358,6 +363,15 @@ def main():
             a = dense(name)
             w.add(name, tuple(reversed(a.shape)), F16 if a.dtype == np.float16 else F32, a.tobytes())
             rep['dense'] += a.nbytes
+    # the decoder's colour probes (export_painter_viz2.py): its 128 and 256 stages as pictures, for the visuals
+    vj = os.path.join(PAINTER, 'viz.json')
+    if os.path.exists(vj):
+        viz = json.load(open(vj))
+        vb = np.fromfile(os.path.join(PAINTER, 'viz.bin'), dtype=np.uint8)
+        for k in ('probe128', 'probe256'):
+            v = viz[k]
+            a = vb[v['offset']:v['offset'] + v['bytes']].view(np.float32).reshape(v['shape'])
+            w.add(f'taef2.{k}', tuple(reversed(a.shape)), F32, a.tobytes())
     sizes['dit'] = dict(rep)
     print(f"dit + decoder: {rep['params'] / 1e6:.1f} M ternary weights, trits {rep['trits'] / 1e6:.1f} MB, "
           f"scales {rep['scales'] / 1e6:.1f} MB, dense {rep['dense'] / 1e6:.1f} MB, zeros {rep['zeros'] / rep['params']:.3f}")
@@ -370,10 +384,22 @@ def main():
         data = np.fromfile(os.path.join(PAINTER, 'schedules.bin'), dtype=np.float32)
         parts_s, at = [], 0
         keys = args.schedules.split(',') + (['1r'] if args.rdm else [])
+        trained = {'2': args.fast_offsets, '4': args.best_offsets}
         for key in keys:
             m, n = allm[key], len(allm[key]['sigmas']) - 1
-            parts_s.append(data[m['offset']:m['offset'] + n * m['rows'] * 3072])
+            rows = data[m['offset']:m['offset'] + n * m['rows'] * 3072].copy()
             sched_meta[key] = dict(sigmas=m['sigmas'], mu=m['mu'], rows=m['rows'], offset=at)
+            if trained.get(key):
+                # the trained branch's constant change to each step's modulation, in the rows' order
+                import torch
+                off = torch.load(trained[key], map_location='cpu', weights_only=False)
+                d = torch.cat([off[k].float().reshape(n, -1) for k in ('double_stream_modulation_img',
+                               'double_stream_modulation_txt', 'single_stream_modulation', 'norm_out.linear')], 1)
+                assert d.shape == (n, m['rows'] * 3072), d.shape
+                rows += d.numpy().reshape(-1)
+                sched_meta[key]['trained'] = os.path.basename(trained[key])
+                print(f'schedule {key}: with the trained offsets of {trained[key]}')
+            parts_s.append(rows)
             at += n * m['rows'] * 3072
         w.add('sched.mod', (3072, at // 3072), F32, np.concatenate(parts_s).tobytes())
 
@@ -406,14 +432,14 @@ def main():
                 n_lora += 1
         return n_lora, meta
 
-    lora_meta = rdm_meta = None
+    lora_meta = rdm_meta = best_meta = None
     if args.lora:
         r = args.lora_rank
         n_lora, meta = add_lora('lora', args.lora, r)
         lora_meta = dict(rank=r, modules=n_lora, steps=[1, 2], scale=1.0,
                          source=args.lora_source,
                          method=meta.get('method', ''), license='apache-2.0',
-                         note=f'the LoRA\'s best rank-{r} approximation (SVD of B A per module); '
+                         note=args.lora_note or f'the LoRA\'s best rank-{r} approximation (SVD of B A per module); '
                               'y = W x + B (A x), on for 1 and 2 steps')
         print(f'lora: {n_lora} modules at rank {r}')
     if args.rdm:
@@ -424,6 +450,13 @@ def main():
                              "as y = W x + B (A x); with schedule '1r' (the modulation from RDM's own time and "
                              'modulation weights) it paints in 1 step')
         print(f'rdm: {n_rdm} modules at rank {args.rdm_rank}')
+    if args.best:
+        n_best, _ = add_lora('best', args.best, args.best_rank)
+        best_meta = dict(rank=args.best_rank, modules=n_best, schedule='4', scale=1.0,
+                         source='trained here (research/scripts/distill_steps.py best)',
+                         note=f'a side branch for {n_best} big matrices, y = W x + B (A x), trained so that 4 steps '
+                              'of the ternary painter match 4 steps of FLUX.2 klein; on for 4 steps')
+        print(f'best: {n_best} modules at rank {args.best_rank}')
 
     # ---- what the runtime needs to know
     painter = {k: man[k] for k in ('text', 'image', 'schedule', 'taef2', 'config') if k in man}
@@ -440,6 +473,8 @@ def main():
         w.string('mindview.lora', json.dumps(lora_meta))
     if rdm_meta:
         w.string('mindview.rdm', json.dumps(rdm_meta))
+    if best_meta:
+        w.string('mindview.best', json.dumps(best_meta))
     w.string('mindview.trits', TRIT_DOC)
     w.string('mindview.deflate', DEFLATE_DOC)
     w.string('mindview.stored', json.dumps({n: len(d) for n, _, ty, d in w.tensors if ty == DEFLATE}))
@@ -448,8 +483,9 @@ def main():
         'dit': man.get('source', {}).get('dit'),
         'cond': cond_source,
         'decoder': 'madebyollin/taef2',
-        **({'lora': f'{args.lora_source} (Apache 2.0), rank {args.lora_rank} of 256, for 1 and 2 steps'}
+        **({'lora': f'{args.lora_source} (Apache 2.0), rank {args.lora_rank}, for 1 and 2 steps'}
            if args.lora else {}),
+        **({'best': f'trained here (distill_steps.py), rank {args.best_rank}, for 4 steps'} if args.best else {}),
         **({'rdm': f'epfl-vita/flux2-klein-1step-rdm minus black-forest-labs/FLUX.2-klein-4B, rank {args.rdm_rank}, '
                    'for 1 step'} if args.rdm else {}),
     }))
@@ -459,7 +495,7 @@ def main():
     for n, _, ty, d in w.tensors:
         k = 'reader' if n.startswith(('token_embd', 'blk.', 'output_norm', 'tokenizer')) else 'cond' if n.startswith('cond.') \
             else 'decoder' if n.startswith('taef2') else 'lora' if n.startswith('lora.') \
-            else 'rdm' if n.startswith('rdm.') else 'dit'
+            else 'rdm' if n.startswith('rdm.') else 'best' if n.startswith('best.') else 'dit'
         parts[k] = parts.get(k, 0) + len(d)
     print('stored: ' + ', '.join(f'{k} {v / 1e6:.1f} MB' for k, v in parts.items()))
     print(f'wrote {args.out}: {total / 1e6:.1f} MB ({total / 2**30:.3f} GiB), {len(w.tensors)} tensors')

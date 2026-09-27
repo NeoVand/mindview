@@ -35,18 +35,15 @@ async function sizes() {
 	return { reader: size('reader'), painter: size('painter') };
 }
 
-/** What the threads piece needs to know about this model. */
-export async function turboModel(): Promise<ThreadsModel> {
-	const p = await file();
-	const text = p.painterConfig.text as { taps?: number[] };
-	return {
-		taps: text.taps ?? [3, 6, 9],
-		readerWeights: '764 million',
-		painterWeights: '3.7 billion',
-		textRows: 256,
-		fast: true
-	};
-}
+/** What the threads piece needs to know about this model (pack_model.py taps the reader after layers 3, 6 and 9). */
+export const TURBO: ThreadsModel = {
+	taps: [3, 6, 9],
+	readerWeights: '764 million',
+	painterWeights: '3.7 billion',
+	textRows: 256,
+	fast: true,
+	name: 'mohsenvand/mindview-t2i-turbo'
+};
 
 /** The reader (Ternary Bonsai 1.7B, its first layers), on the device. */
 export async function turboReader(

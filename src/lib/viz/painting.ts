@@ -21,6 +21,7 @@ import { Gallery, READING } from './gallery';
 import { LineLayer } from './lines';
 import type { ImagePlanes } from './planes';
 import { WordWeave, type Stitch } from './word-weave';
+import { textureImage, type PaintEvent } from './recording';
 
 type V3 = [number, number, number];
 export const GRID = 32;
@@ -88,6 +89,12 @@ export class Painting {
 	private finale: { spots: { y: number; z: number }[]; side: number };
 	private doneAt = 0;
 	private words: { first: number; count: number };
+	// recording a live painting: its events, with times from its start, and pictures still being read back
+	private log?: { events: PaintEvent[]; t0: number; waiting: number };
+	// playing a recorded one: the events still to come, and the pictures decoded so far
+	private pending: PaintEvent[] = [];
+	private playT0 = 0;
+	private bitmaps = new Map<Blob, ImageBitmap>();
 
 	constructor(
 		private device: GPUDevice,
@@ -169,8 +176,10 @@ export class Painting {
 		scheduler: GpuScheduler,
 		prompt: string,
 		taps: V3[][],
-		seed: number
+		seed: number,
+		log?: PaintEvent[]
 	) {
+		if (log) this.log = { events: log, t0: performance.now(), waiting: 0 };
 		painter.setSteps(this.steps);
 		if (this.fast) painter.textLength = 256;
 		painter.setNoise(undefined, seed, this.fast);
@@ -182,27 +191,42 @@ export class Painting {
 			t.done = async () => {
 				await before?.();
 				this.encoded = (i + 1) / tasks.length;
+				this.note({ kind: 'encoded', v: this.encoded });
 			};
 		});
 		scheduler.push(...tasks);
 		const early = painter.taef2.earlyTexture;
-		for (let s = 0; s < this.steps; s++)
+		for (let s = 0; s < this.steps; s++) {
+			const kept = new Map<number, GPUTexture>();
 			scheduler.push(
 				...painter.stepTasks(
 					s,
 					this.words,
-					(b, attn, _space, words) => this.read(s, b, attn, words),
+					(b, attn, _space, words) => {
+						this.note({
+							kind: 'block',
+							s,
+							b,
+							attn: attn.slice(),
+							words: words?.slice() ?? new Float32Array()
+						});
+						this.read(s, b, attn, words);
+					},
 					{
 						// each stage of the decoder is copied as it is made, and stands as its work finishes
 						record: (enc, res) =>
-							this.keep(
-								res === 512 ? painter.taef2.texture : painter.taef2.stageTextures.get(res)!,
-								s * TICKS_PER_STEP + 25 + Math.log2(res / 64),
-								STAGE[res],
-								enc
+							kept.set(
+								res,
+								this.keep(
+									res === 512 ? painter.taef2.texture : painter.taef2.stageTextures.get(res)!,
+									s * TICKS_PER_STEP + 25 + Math.log2(res / 64),
+									STAGE[res],
+									enc
+								).tex
 							),
 						done: (res) => {
 							this.ticks = Math.max(this.ticks, s * TICKS_PER_STEP + 26 + Math.log2(res / 64));
+							this.notePicture(kept.get(res)!, (image) => ({ kind: 'stage', s, res, image }));
 						}
 					},
 					scheduler.slice,
@@ -213,9 +237,12 @@ export class Painting {
 					}
 				)
 			);
+		}
 		scheduler.push(
 			...painter.finalTasks(() => {
-				this.finalPlane = this.keep(painter.taef2.texture, -1, 0);
+				const final = this.keep(painter.taef2.texture, -1, 0);
+				this.finalPlane = final.plane;
+				this.notePicture(final.tex, (image) => ({ kind: 'final', image }));
 				// beside the finished picture: each word's reading over the whole painting
 				this.paintFinaleMaps(this.sum.map((x) => x / Math.max(1, this.reads)));
 				this.done = true;
@@ -395,15 +422,99 @@ export class Painting {
 		const tex = this.device.createTexture({
 			size: [src.width, src.height],
 			format: 'rgba8unorm',
-			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC
 		});
-		this.textures.push(tex);
 		const e = enc ?? this.device.createCommandEncoder();
 		e.copyTextureToTexture({ texture: src }, { texture: tex }, [src.width, src.height]);
 		if (!enc) this.device.queue.submit([e.finish()]);
+		return { plane: this.stand(tex, tick, side), tex };
+	}
+
+	/** Stand a texture in the scene at `tick` with side `side` (tick -1: the finished image). */
+	private stand(tex: GPUTexture, tick: number, side: number) {
+		this.textures.push(tex);
 		const plane = this.planes.add(tex);
 		if (tick >= 0) this.canvases.push({ plane, tick, side });
 		return plane;
+	}
+
+	/** A recorded picture, stood in the scene as keep() stands a live one. */
+	private standImage(image: ImageBitmap, tick: number, side: number) {
+		const tex = this.device.createTexture({
+			size: [image.width, image.height],
+			format: 'rgba8unorm',
+			usage:
+				GPUTextureUsage.TEXTURE_BINDING |
+				GPUTextureUsage.COPY_DST |
+				GPUTextureUsage.RENDER_ATTACHMENT
+		});
+		this.device.queue.copyExternalImageToTexture({ source: image }, { texture: tex }, [
+			image.width,
+			image.height
+		]);
+		return this.stand(tex, tick, side);
+	}
+
+	// ---- recording and playing back
+
+	/** While recording: an event, at the time it happened. */
+	private note(e: DistributiveOmit<PaintEvent, 't'>, t = performance.now()) {
+		if (this.log) this.log.events.push({ ...e, t: (t - this.log.t0) / 1000 } as PaintEvent);
+	}
+
+	/** While recording: a picture, read back from its texture (the event keeps the time it was made). */
+	private notePicture(tex: GPUTexture, event: (image: Blob) => DistributiveOmit<PaintEvent, 't'>) {
+		const log = this.log;
+		if (!log) return;
+		const t = performance.now();
+		log.waiting++;
+		textureImage(this.device, tex).then((image) => {
+			this.note(event(image), t);
+			log.events.sort((a, b) => a.t - b.t);
+			log.waiting--;
+		});
+	}
+
+	/** A recording is complete once the painting is done and its pictures are read back. */
+	get recorded() {
+		return this.done && !!this.log && this.log.waiting === 0;
+	}
+
+	/** Play a recorded painting (see recording.ts): its events come at the times they happened (call update()). */
+	play(events: PaintEvent[], taps: V3[][]) {
+		this.buildBraid(taps);
+		this.mapPlanes = this.maps.map((t) => this.planes.add(t));
+		this.pending = [...events];
+		this.playT0 = performance.now();
+		for (const e of events)
+			if (e.kind === 'stage' || e.kind === 'final')
+				createImageBitmap(e.image).then((b) => this.bitmaps.set(e.image, b));
+	}
+
+	/** Apply the recorded events that are due (every frame; nothing when painting live). */
+	update() {
+		const t = (performance.now() - this.playT0) / 1000;
+		while (this.pending.length && this.pending[0].t <= t) {
+			const e = this.pending[0];
+			if (e.kind === 'encoded') this.encoded = e.v;
+			else if (e.kind === 'block')
+				this.read(e.s, e.b, e.attn, e.words.length ? e.words : undefined);
+			else {
+				const image = this.bitmaps.get(e.image);
+				if (!image) return; // still decoding: wait for it, keeping the order
+				if (e.kind === 'stage') {
+					this.standImage(image, e.s * TICKS_PER_STEP + 25 + Math.log2(e.res / 64), STAGE[e.res]);
+					this.ticks = Math.max(this.ticks, e.s * TICKS_PER_STEP + 26 + Math.log2(e.res / 64));
+				} else {
+					this.finalPlane = this.standImage(image, -1, 0);
+					this.paintFinaleMaps(this.sum.map((x) => x / Math.max(1, this.reads)));
+					this.done = true;
+					this.doneAt = performance.now();
+					this.ticks = this.ticksTotal;
+				}
+			}
+			this.pending.shift();
+		}
 	}
 
 	/**
@@ -490,8 +601,12 @@ export class Painting {
 		this.braid.destroy();
 		this.gallery.destroy();
 		for (const t of this.textures) t.destroy();
+		for (const b of this.bitmaps.values()) b.close();
+		this.pending = [];
 	}
 }
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
 /** Attention over 16 x 16 patches [patch][word] as over 32 x 32 (each patch repeated over the 2 x 2 it covers). */
 function enlarge(a: Float32Array, n: number) {

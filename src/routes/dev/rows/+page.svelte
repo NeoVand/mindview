@@ -1,7 +1,7 @@
 <script lang="ts">
 	// The one-file model painting the same prompts several ways, side by side, with the time of each painting. Each
 	// column is steps/text rows[/precision[/p]]: ?cols=4/512,4/auto/f32,2/auto,2/256/f16/p (1 or 2 steps turn the few-step
-	// LoRA on when the file has it; 1r is 1 step with the 1-step fine-tune; p runs the first step at 256 x 256). ?file= picks a file in static/models/mindview-t2i/ instead of the default model.
+	// LoRA on when the file has it; 1r is 1 step with the 1-step fine-tune; p runs the first step at 256 x 256). ?file= picks a file in static/models/mindview-t2i/ instead of the default model; ?prompts=n paints only the first n.
 	import { asset } from '$app/paths';
 	import { page } from '$app/state';
 	import { labDevice } from '$lib/lab/shared';
@@ -10,7 +10,7 @@
 	import { PackedModel } from '$lib/runtime/packed';
 	import { Painter, type Schedule } from '$lib/runtime/painter';
 
-	const PROMPTS = [
+	const ALL_PROMPTS = [
 		'a bonsai tree made of glowing circuitry in a dark museum, volumetric light',
 		'a red fox sleeping in the snow at dawn',
 		'three apples and one pear on a wooden table',
@@ -33,6 +33,7 @@
 		};
 	};
 	const file = q.get('file');
+	const PROMPTS = ALL_PROMPTS.slice(0, Number(q.get('prompts') ?? ALL_PROMPTS.length));
 	const seed = Number(q.get('seed') ?? 7);
 	let cells = $state<Record<string, { url: string; secs: number }>>({});
 	let status = $state('Loading the model');

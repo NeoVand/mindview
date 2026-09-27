@@ -16,6 +16,7 @@ import { GpuScheduler } from '$lib/runtime/scheduler';
 import { LineLayer } from './lines';
 import { Painting, TICKS_PER_STEP } from './painting';
 import { ImagePlanes } from './planes';
+import type { ReaderTrace, Recording } from './recording';
 
 type V3 = [number, number, number];
 
@@ -27,6 +28,7 @@ export interface ThreadsModel {
 	textRows: number; // rows the painter's text side is padded to
 	/** Fast: 2 passes, the first a sketch at 256 x 256 (the one-file model with its few-step LoRA). */
 	fast: boolean;
+	name?: string; // the model file, for recordings
 }
 
 /** The lab's models: the 1.7B read to layer 21 and the painter bundle. */
@@ -136,12 +138,17 @@ export class Threads {
 	// a new prompt: the old scene fades out while the new one is read (and nothing is painted from the old one)
 	private reading = false;
 	private readId = 0;
+	private readingCaption = ''; // what the reading is doing, while it runs
 	private quiet = 0; // 0..1: the finished picture on its own (lines dimmed, since they run straight at the camera)
 	private far = 0; // 0..1: the whole journey seen from far away (lines dimmed)
+	// a recorded run being played (nothing is computed), or one being recorded from a live run (record = true)
+	private playback?: Recording;
+	private recorder?: Recording;
+	record = false;
 
 	constructor(
 		private gpu: GPU,
-		private llm: BonsaiLLM,
+		private llm: BonsaiLLM | undefined,
 		private onStatus: (s: ThreadsStatus) => void,
 		readonly model: ThreadsModel = LAB_MODEL
 	) {
@@ -184,8 +191,23 @@ export class Threads {
 		this.painter = painter;
 	}
 
+	/** The reader is ready (a piece made to play a recording can then read live). */
+	attachReader(llm: BonsaiLLM) {
+		this.llm = llm;
+	}
+
+	/** The run just recorded (record = true), once its painting is done. */
+	get recording(): Recording | undefined {
+		return this.painting?.recorded ? this.recorder : undefined;
+	}
+
+	/** Whether there is a painting to follow the reader: a painter to compute it, or a recording to play. */
+	private get canPaint() {
+		return !!this.painter || !!this.playback;
+	}
+
 	private startPainting() {
-		if (!this.painter) return;
+		if (!this.canPaint) return;
 		const x0 = (this.layers * DX) / 2;
 		const painting = new Painting(
 			this.gpu.device,
@@ -200,7 +222,17 @@ export class Threads {
 		this.painting = painting;
 		try {
 			const taps = this.threadPos.map((ps) => this.model.taps.map((l) => ps[l]));
-			painting.start(this.painter, this.llm, this.scheduler, this.prompt, taps, this.options.seed);
+			if (this.playback) painting.play(this.playback.paint, taps);
+			else if (this.painter && this.llm)
+				painting.start(
+					this.painter,
+					this.llm,
+					this.scheduler,
+					this.prompt,
+					taps,
+					this.options.seed,
+					this.recorder?.paint
+				);
 		} catch (err) {
 			this.paintError = err instanceof Error ? err.message : String(err);
 		}
@@ -212,7 +244,7 @@ export class Threads {
 
 	/** Journey units: 0..28 the reader's layers, then the handoff, then one unit per painter readout. */
 	private get journeyLength() {
-		return this.painter ? this.layers + HANDOFF + this.paintTicks : this.layers;
+		return this.canPaint ? this.layers + HANDOFF + this.paintTicks : this.layers;
 	}
 
 	private xAt(u: number) {
@@ -235,7 +267,7 @@ export class Threads {
 	get front() {
 		if (!this.ready) return 0;
 		const p = this.progress(this.time);
-		if (p < this.layers || !this.painter) return p;
+		if (p < this.layers || !this.canPaint) return p;
 		if (!this.painting || this.painting.encoded < 1 || this.painting.ticks < 1)
 			return this.layers + HANDOFF * (this.painting ? this.painting.encoded : 0);
 		return this.layers + HANDOFF + this.paintFront;
@@ -263,7 +295,7 @@ export class Threads {
 
 	/** Paint again with the current options (steps, seed), keeping what the reader did. */
 	repaint() {
-		if (!this.painter || !this.ready) return;
+		if (!this.painter || !this.ready || this.playback) return;
 		this.scheduler.clear();
 		this.painting?.destroy();
 		this.painting = undefined;
@@ -309,31 +341,35 @@ export class Threads {
 		this.time = Math.max(0, Math.min(this.total, this.time + dt));
 	}
 
-	async read(prompt: string) {
+	/** What the reading is doing (shown until the new journey begins). */
+	private say(caption: string) {
+		this.readingCaption = caption;
+		this.onStatus({ caption, busy: true });
+	}
+
+	/** Read a prompt live: the reader runs here, then the painter when it is attached. */
+	read(prompt: string) {
+		return this.run(prompt);
+	}
+
+	/** Play a recorded run (see recording.ts): drawn as a live run is, from the numbers in the recording. */
+	play(rec: Recording) {
+		return this.run(rec.prompt, rec);
+	}
+
+	private async run(prompt: string, rec?: Recording) {
 		const id = ++this.readId;
 		this.reading = true;
 		this.prompt = prompt;
+		this.playback = rec;
+		this.recorder = undefined;
+		this.readingCaption = rec ? 'Loading the recording' : 'Reading your words';
 		this.painting?.destroy();
 		this.painting = undefined;
 		this.planes.clear();
 		this.scheduler.clear();
 		this.paintFront = 0;
 		this.paintError = '';
-		const llm = this.llm,
-			c = llm.config,
-			L = llm.layout,
-			dev = this.gpu.device;
-		const N = MAX_TOKENS,
-			D = c.dim,
-			F = c.ffn,
-			H = c.heads,
-			HD = c.headDim,
-			KV = c.kvHeads * HD,
-			Q = H * HD;
-		// the painter uses the words only as they stand after its last tap, so the reader stops there
-		const TAP_LAYERS = this.model.taps;
-		const NL = TAP_LAYERS[TAP_LAYERS.length - 1],
-			G = H / c.kvHeads;
 		// the reading is long JavaScript work: give frames a turn every few milliseconds, and stop if a newer
 		// prompt has come in meanwhile (breathe() then returns true)
 		let since = performance.now();
@@ -344,55 +380,28 @@ export class Threads {
 			}
 			return id !== this.readId;
 		};
-		this.onStatus({ caption: `Reading your words through ${NL} layers`, busy: true });
-		const r = await llm.prefill(
-			llm.tokenizer.encode(chatPrompt(prompt)).slice(0, MAX_TOKENS),
-			this.scheduler,
-			NL
-		);
-		if (await breathe()) return;
-		const n = r.ids.length;
-		const end = r.tokens.findIndex((t, i) => i > 3 && t.startsWith('<|im_end'));
-		const W = Array.from({ length: Math.max(1, (end > 0 ? end : n) - 3) }, (_, i) => 3 + i);
-		const nw = W.length;
-
-		// ---- read back what the pass left in the arena
-		this.onStatus({ caption: 'Collecting every partial sum', busy: true });
-		const regions: { offset: number; count: number }[] = [];
-		for (let l = 0; l <= NL; l++)
-			for (const t of W) regions.push({ offset: L.resid + (l * N + t) * D, count: D });
-		for (let l = 0; l < NL; l++)
-			for (const t of W) regions.push({ offset: L.act + (l * N + t) * F, count: F });
-		for (let l = 0; l < NL; l++) regions.push({ offset: L.v + l * N * KV, count: n * KV });
-		for (let l = 0; l < NL; l++)
-			for (let h = 0; h < H; h++)
-				regions.push({ offset: L.probs + ((l * H + h) * N + W[0]) * N, count: nw * N });
-		const got = await llm.readMany(regions);
-		if (await breathe()) return;
-		let k = 0;
-		const resid = Array.from({ length: NL + 1 }, () => W.map(() => got[k++]));
-		const act = Array.from({ length: NL }, () => W.map(() => got[k++]));
-		const vals = Array.from({ length: NL }, () => got[k++]);
-		const probs = Array.from({ length: NL }, () => Array.from({ length: H }, () => got[k++])); // [l][h][(t - W0) * N + s]
-
-		// ---- two fixed directions: the main axes along which the words move, each layer rescaled to a common size
-		const norm = (v: Float32Array) => Math.sqrt(v.reduce((a, x) => a + x * x, 0));
-		const scale = resid.map((row) => median(row.map(norm)));
-		const mu = resid.map((row, l) => {
-			const m = new Float64Array(D);
-			for (const v of row) for (let i = 0; i < D; i++) m[i] += v[i] / scale[l] / nw;
-			return m;
-		});
-		const X: Float64Array[] = [];
-		for (let l = 1; l <= NL; l++)
-			for (const v of resid[l]) {
-				const x = new Float64Array(D);
-				for (let i = 0; i < D; i++) x[i] = v[i] / scale[l] - mu[l][i];
-				X.push(x);
-			}
-		const two = await topTwo(X, D, breathe);
-		if (!two) return;
-		const [e0, e1] = two;
+		const trace = rec ? rec.reader : await this.gather(prompt, breathe);
+		if (!trace || (await breathe())) return;
+		if (this.record && !rec)
+			this.recorder = {
+				prompt,
+				seed: this.options.seed,
+				steps: this.model.fast ? 2 : this.options.steps,
+				fast: this.model.fast,
+				model: this.model.name ?? '',
+				reader: trace,
+				paint: []
+			};
+		const dev = this.gpu.device,
+			{ tokens, W, N, NL, resid, act, vals, probs, proj } = trace,
+			{ D, F, H, HD, KV } = trace.dims,
+			G = H / (KV / HD),
+			nw = W.length,
+			n = vals[0].length / KV,
+			per = F + H * HD,
+			TAP_LAYERS = this.model.taps;
+		const [e0, e1] = trace.e;
+		const { scale, mu } = centre(resid, D);
 		const dot2 = (v: ArrayLike<number>): [number, number] => {
 			let a = 0,
 				b = 0;
@@ -405,78 +414,8 @@ export class Threads {
 		const hE = resid.map((row) => row.map(dot2));
 		const muE = mu.map(dot2);
 
-		// ---- every column of Wo and Wdown, projected onto those directions (on the GPU)
-		const Ebuf = dev.createBuffer({
-			size: D * 8,
-			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-		});
-		const Einter = new Float32Array(D * 2);
-		for (let i = 0; i < D; i++) {
-			Einter[2 * i] = e0[i];
-			Einter[2 * i + 1] = e1[i];
-		}
-		dev.queue.writeBuffer(Ebuf, 0, Einter);
-		const per = F + Q;
-		const out = dev.createBuffer({
-			size: NL * per * 8,
-			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
-		});
-		const params = dev.createBuffer({
-			size: NL * 2 * 256,
-			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-		});
-		const { codes, scales } = llm.weightBuffers;
-		const enc = dev.createCommandEncoder();
-		const pass = enc.beginComputePass();
-		pass.setPipeline(this.project);
-		const pdata = new Uint32Array(NL * 2 * 64);
-		const binds: GPUBindGroup[] = [];
-		for (let l = 0; l < NL; l++) {
-			const jobs = [
-				llm.tensor(`blk.${l}.ffn_down.weight`),
-				llm.tensor(`blk.${l}.attn_output.weight`)
-			];
-			jobs.forEach((w, i) => {
-				const slot = l * 2 + i;
-				pdata.set([w.rows, w.cols, w.codes, w.scales, l * per + (i ? F : 0)], slot * 64);
-				binds[slot] = dev.createBindGroup({
-					layout: this.project.getBindGroupLayout(0),
-					entries: [
-						{ binding: 0, resource: { buffer: params, offset: slot * 256, size: 32 } },
-						{ binding: 1, resource: { buffer: codes } },
-						{ binding: 2, resource: { buffer: scales } },
-						{ binding: 3, resource: { buffer: Ebuf } },
-						{ binding: 4, resource: { buffer: out } }
-					]
-				});
-			});
-		}
-		dev.queue.writeBuffer(params, 0, pdata);
-		for (let l = 0; l < NL; l++)
-			[F, Q].forEach((K, i) => {
-				pass.setBindGroup(0, binds[l * 2 + i]);
-				pass.dispatchWorkgroups(Math.ceil(K / 64));
-			});
-		pass.end();
-		const read = dev.createBuffer({
-			size: NL * per * 8,
-			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-		});
-		enc.copyBufferToBuffer(out, 0, read, 0, NL * per * 8);
-		dev.queue.submit([enc.finish()]);
-		await read.mapAsync(GPUMapMode.READ);
-		if (id !== this.readId) {
-			read.destroy();
-			return;
-		}
-		const proj = new Float32Array(read.getMappedRange()).slice();
-		read.destroy();
-		out.destroy();
-		params.destroy();
-		Ebuf.destroy();
-
 		// ---- the threads: partial sums, term by term
-		this.onStatus({ caption: 'Laying out the threads', busy: true });
+		this.say('Laying out the threads');
 		let lo0 = Infinity,
 			lo1 = Infinity,
 			hi0 = -Infinity,
@@ -676,23 +615,13 @@ export class Threads {
 		this.threadPos = threadPos;
 		this.links.set(new Float32Array(linkPts), new Uint32Array(linkAttr), palette);
 
-		// the model's own reading of every word at every layer
-		this.onStatus({
-			caption: 'Asking the model what each word has become at every layer',
-			busy: true
-		});
-		const vecs = new Float32Array((NL + 1) * nw * D);
-		for (let l = 0; l <= NL; l++)
-			for (let i = 0; i < nw; i++) vecs.set(resid[l][i], (l * nw + i) * D);
-		const lens = await llm.readout(vecs, (NL + 1) * nw, this.scheduler);
-		if (await breathe()) return;
+		// the model's own reading of every word at every layer, beside its thread
 		this.ghosts = [];
 		for (let l = 0; l <= NL; l++)
 			for (let i = 0; i < nw; i++) {
-				const k = l * nw + i;
-				const text = clean(llm.tokenizer.decode([lens.ids[k]]));
-				if (text)
-					this.ghosts.push({ text, layer: l, word: i, prob: lens.probs[k], pos: threadPos[i][l] });
+				const g = trace.ghosts[l * nw + i];
+				if (g.text)
+					this.ghosts.push({ text: g.text, layer: l, word: i, prob: g.prob, pos: threadPos[i][l] });
 			}
 		this.ghostLayer = new WordLayer(
 			dev,
@@ -708,7 +637,7 @@ export class Threads {
 		);
 
 		// labels at the top of each thread
-		const texts = W.map((t) => clean(r.tokens[t]));
+		const texts = W.map((t) => clean(tokens[t]));
 		this.words = new WordLayer(
 			dev,
 			this.frame,
@@ -764,6 +693,167 @@ export class Threads {
 		this.onStatus({ caption: '', busy: false });
 	}
 
+	/**
+	 * The reader's pass over the prompt, and what the piece needs from it: the states, activations, attention and
+	 * values at every layer, the two directions the threads are drawn along, every column of Wo and Wdown projected
+	 * on them (on the GPU), and the logit lens's reading of each word at each layer. Null if a newer prompt came in.
+	 */
+	private async gather(
+		prompt: string,
+		breathe: () => Promise<boolean>
+	): Promise<ReaderTrace | null> {
+		const llm = this.llm;
+		if (!llm) throw new Error('The reader is not loaded.');
+		const c = llm.config,
+			L = llm.layout,
+			dev = this.gpu.device;
+		const N = MAX_TOKENS,
+			D = c.dim,
+			F = c.ffn,
+			H = c.heads,
+			HD = c.headDim,
+			KV = c.kvHeads * HD,
+			Q = H * HD;
+		// the painter uses the words only as they stand after its last tap, so the reader stops there
+		const TAP_LAYERS = this.model.taps;
+		const NL = TAP_LAYERS[TAP_LAYERS.length - 1];
+		this.say(`Reading your words through ${NL} layers`);
+		const r = await llm.prefill(
+			llm.tokenizer.encode(chatPrompt(prompt)).slice(0, MAX_TOKENS),
+			this.scheduler,
+			NL
+		);
+		if (await breathe()) return null;
+		const n = r.ids.length;
+		const end = r.tokens.findIndex((t, i) => i > 3 && t.startsWith('<|im_end'));
+		const W = Array.from({ length: Math.max(1, (end > 0 ? end : n) - 3) }, (_, i) => 3 + i);
+		const nw = W.length;
+
+		// ---- read back what the pass left in the arena
+		this.say('Collecting every partial sum');
+		const regions: { offset: number; count: number }[] = [];
+		for (let l = 0; l <= NL; l++)
+			for (const t of W) regions.push({ offset: L.resid + (l * N + t) * D, count: D });
+		for (let l = 0; l < NL; l++)
+			for (const t of W) regions.push({ offset: L.act + (l * N + t) * F, count: F });
+		for (let l = 0; l < NL; l++) regions.push({ offset: L.v + l * N * KV, count: n * KV });
+		for (let l = 0; l < NL; l++)
+			for (let h = 0; h < H; h++)
+				regions.push({ offset: L.probs + ((l * H + h) * N + W[0]) * N, count: nw * N });
+		const got = await llm.readMany(regions);
+		if (await breathe()) return null;
+		let k = 0;
+		const resid = Array.from({ length: NL + 1 }, () => W.map(() => got[k++]));
+		const act = Array.from({ length: NL }, () => W.map(() => got[k++]));
+		const vals = Array.from({ length: NL }, () => got[k++]);
+		const probs = Array.from({ length: NL }, () => Array.from({ length: H }, () => got[k++])); // [l][h][(t - W0) * N + s]
+
+		// ---- two fixed directions: the main axes along which the words move, each layer rescaled to a common size
+		const { scale, mu } = centre(resid, D);
+		const X: Float64Array[] = [];
+		for (let l = 1; l <= NL; l++)
+			for (const v of resid[l]) {
+				const x = new Float64Array(D);
+				for (let i = 0; i < D; i++) x[i] = v[i] / scale[l] - mu[l][i];
+				X.push(x);
+			}
+		const two = await topTwo(X, D, breathe);
+		if (!two) return null;
+		const [e0, e1] = two;
+
+		// ---- every column of Wo and Wdown, projected onto those directions (on the GPU)
+		const Ebuf = dev.createBuffer({
+			size: D * 8,
+			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+		});
+		const Einter = new Float32Array(D * 2);
+		for (let i = 0; i < D; i++) {
+			Einter[2 * i] = e0[i];
+			Einter[2 * i + 1] = e1[i];
+		}
+		dev.queue.writeBuffer(Ebuf, 0, Einter);
+		const per = F + Q;
+		const out = dev.createBuffer({
+			size: NL * per * 8,
+			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+		});
+		const params = dev.createBuffer({
+			size: NL * 2 * 256,
+			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+		});
+		const { codes, scales } = llm.weightBuffers;
+		const enc = dev.createCommandEncoder();
+		const pass = enc.beginComputePass();
+		pass.setPipeline(this.project);
+		const pdata = new Uint32Array(NL * 2 * 64);
+		const binds: GPUBindGroup[] = [];
+		for (let l = 0; l < NL; l++) {
+			const jobs = [
+				llm.tensor(`blk.${l}.ffn_down.weight`),
+				llm.tensor(`blk.${l}.attn_output.weight`)
+			];
+			jobs.forEach((w, i) => {
+				const slot = l * 2 + i;
+				pdata.set([w.rows, w.cols, w.codes, w.scales, l * per + (i ? F : 0)], slot * 64);
+				binds[slot] = dev.createBindGroup({
+					layout: this.project.getBindGroupLayout(0),
+					entries: [
+						{ binding: 0, resource: { buffer: params, offset: slot * 256, size: 32 } },
+						{ binding: 1, resource: { buffer: codes } },
+						{ binding: 2, resource: { buffer: scales } },
+						{ binding: 3, resource: { buffer: Ebuf } },
+						{ binding: 4, resource: { buffer: out } }
+					]
+				});
+			});
+		}
+		dev.queue.writeBuffer(params, 0, pdata);
+		for (let l = 0; l < NL; l++)
+			[F, Q].forEach((K, i) => {
+				pass.setBindGroup(0, binds[l * 2 + i]);
+				pass.dispatchWorkgroups(Math.ceil(K / 64));
+			});
+		pass.end();
+		const read = dev.createBuffer({
+			size: NL * per * 8,
+			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+		});
+		enc.copyBufferToBuffer(out, 0, read, 0, NL * per * 8);
+		dev.queue.submit([enc.finish()]);
+		await read.mapAsync(GPUMapMode.READ);
+		const proj = new Float32Array(read.getMappedRange()).slice();
+		read.destroy();
+		out.destroy();
+		params.destroy();
+		Ebuf.destroy();
+		if (await breathe()) return null;
+
+		// ---- the model's own reading of every word at every layer
+		this.say('Asking the model what each word has become at every layer');
+		const vecs = new Float32Array((NL + 1) * nw * D);
+		for (let l = 0; l <= NL; l++)
+			for (let i = 0; i < nw; i++) vecs.set(resid[l][i], (l * nw + i) * D);
+		const lens = await llm.readout(vecs, (NL + 1) * nw, this.scheduler);
+		const ghosts = Array.from({ length: (NL + 1) * nw }, (_, k) => ({
+			text: clean(llm.tokenizer.decode([lens.ids[k]])),
+			prob: lens.probs[k]
+		}));
+		return {
+			tokens: r.tokens,
+			W,
+			NL,
+			N,
+			dims: { D, F, H, HD, KV },
+			resid,
+			act,
+			vals,
+			probs,
+			e: [Float32Array.from(e0), Float32Array.from(e1)],
+			proj,
+			ghosts
+		};
+	}
+
 	/** Layer-time (0..28) reached at clock time t. */
 	private progress(t: number) {
 		if (t <= this.starts[0]) return 0;
@@ -817,8 +907,9 @@ export class Threads {
 		const NL = this.layers;
 		const total = this.journeyLength;
 		// the painter starts when the reader is done
-		if (this.ready && !this.reading && this.painter && prog >= NL && !this.painting)
+		if (this.ready && !this.reading && this.canPaint && prog >= NL && !this.painting)
 			this.startPainting();
+		this.painting?.update();
 		// fade out while a new prompt is being read, back in when its journey begins
 		this.post.fade += ((this.reading ? 0 : 1) - this.post.fade) * (1 - Math.exp(-dt * 5));
 		if (this.painting?.ticks && !this.paused) {
@@ -837,7 +928,9 @@ export class Threads {
 			this.modeTime += dt;
 			if (this.mode === 'live') {
 				this.ride = front;
-				const finished = this.painter ? !!this.painting?.done && front >= total - 0.01 : prog >= NL;
+				const finished = this.canPaint
+					? !!this.painting?.done && front >= total - 0.01
+					: prog >= NL;
 				if (finished) {
 					this.mode = this.painting?.done ? 'finale' : 'overview';
 					this.modeTime = 0;
@@ -1029,9 +1122,12 @@ export class Threads {
 			const at = Math.min(NL, Math.floor(this.ride) + 1);
 			const tick = Math.floor(this.ride - NL - HANDOFF);
 			const passes = this.painting?.steps ?? this.options.steps;
-			if (this.paintError) caption = `The painter stopped: ${this.paintError}`;
+			if (this.reading) caption = this.readingCaption;
+			else if (this.paintError) caption = `The painter stopped: ${this.paintError}`;
 			else if (this.mode === 'finale')
-				caption = `Your words, painted: ${this.model.readerWeights} ternary weights read them, ${this.model.painterWeights} turned noise into this in ${passes} ${passes === 1 ? 'pass' : 'passes'}, all in this browser tab.`;
+				caption = this.playback
+					? `A recording of a real run: ${this.model.readerWeights} ternary weights read these words, ${this.model.painterWeights} turned noise into this in ${passes} ${passes === 1 ? 'pass' : 'passes'}, in a browser tab. Change the words to run it here, live.`
+					: `Your words, painted: ${this.model.readerWeights} ternary weights read them, ${this.model.painterWeights} turned noise into this in ${passes} ${passes === 1 ? 'pass' : 'passes'}, all in this browser tab.`;
 			else if (this.mode === 'overview')
 				caption = this.painting?.done
 					? `The whole journey: ${this.model.readerWeights} weights read your ${this.wordCount} words, ${this.model.painterWeights} painted them. Drag to turn, scroll to come closer, or drag along the timeline to go back.`
@@ -1039,7 +1135,7 @@ export class Threads {
 			else if ((this.mode === 'rewind' || this.mode === 'manual') && !inPainter)
 				caption = `Looking back at layer ${at} of ${NL}. Each jagged step is the sum of everything that layer added to the word.`;
 			else if (this.ride >= NL && this.ride - NL - HANDOFF < 0.5)
-				caption = this.painter
+				caption = this.canPaint
 					? `The reading stops after layer ${NL}: the painter needs nothing later. It takes each word as it stood after layers ${listed(this.model.taps)} (the beads); the reader reads the prompt once more, padded to the ${this.model.textRows} rows the painter expects, and here a linear map merges each word's three states into one (${Math.round((this.painting?.encoded ?? 0) * 100)}%).`
 					: 'The painter is still downloading.';
 			else if (inPainter && this.painting && tick >= this.painting.ticksTotal)
@@ -1054,7 +1150,7 @@ export class Threads {
 					? `The painter, pass 1 of ${passes}: a sketch at a quarter of the size`
 					: `The painter, pass ${p + 1} of ${passes}`;
 				const patches = sketch ? '256' : '1,024';
-				const lens = !!this.painter?.hasLens;
+				const lens = !this.playback && !!this.painter?.hasLens;
 				caption =
 					r < 25.5
 						? `${head}, block ${Math.min(25, Math.max(1, Math.round(r)))} of 25. Inside each block the picture's ${patches} patches read your words; the lower row shows where, in the words' colours. Your words run beneath as a cable: a word the picture reads hard climbs out to the spot it is read most, and its name lights up. The arcs are the words reading each other.${lens ? ' Then the block changes the picture (the upper row).' : ''}`
@@ -1070,7 +1166,7 @@ export class Threads {
 					frac < ATTN_SHARE
 						? `Layer 1 of ${NL}. "${word}" first takes in light from the words before it: each coloured stroke is one attention head reading one word.`
 						: `Layer 1 of ${NL}. Then its 6,144 neurons each push it a little: ${Math.round(((frac - ATTN_SHARE) / (1 - ATTN_SHARE)) * 6144).toLocaleString()} of 6,144 added so far. Each push is one column of 2,048 weights, each −1, 0 or +1.`;
-			else if (this.painter && this.model.taps.some((t) => prog >= t && prog < t + 1.5))
+			else if (this.canPaint && this.model.taps.some((t) => prog >= t && prog < t + 1.5))
 				caption = `Layer ${l} of ${NL}. The beads on the brighter ring mark where the painter will take each word: as it stands after layers ${listed(this.model.taps)}.`;
 			else
 				caption = `Layer ${l} of ${NL}. Each thread is one of your words; each jagged step is the sum of everything that layer adds to it. The faint italic words are what the model would say each word has become.`;
@@ -1082,7 +1178,7 @@ export class Threads {
 				total,
 				marks: [
 					...Array.from({ length: NL + 1 }, (_, l) => l),
-					...(this.painter
+					...(this.canPaint
 						? Array.from(
 								{ length: (this.painting?.steps ?? this.options.steps) + 1 },
 								(_, s) => NL + HANDOFF + s * TICKS_PER_STEP
@@ -1142,6 +1238,18 @@ async function topTwo(
 		b = unit(b.map((x, i) => x - d * a[i]));
 	}
 	return [a, b];
+}
+
+/** Each layer's typical size (the median norm of its words) and its mean word, at that size. */
+function centre(resid: Float32Array[][], D: number) {
+	const norm = (v: Float32Array) => Math.sqrt(v.reduce((a, x) => a + x * x, 0));
+	const scale = resid.map((row) => median(row.map(norm)));
+	const mu = resid.map((row, l) => {
+		const m = new Float64Array(D);
+		for (const v of row) for (let i = 0; i < D; i++) m[i] += v[i] / scale[l] / row.length;
+		return m;
+	});
+	return { scale, mu };
 }
 
 /** A word's colour by its place in the prompt: glacier, through bone, to ember (linear rgb). */
