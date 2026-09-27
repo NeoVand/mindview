@@ -26,12 +26,12 @@ by their weights: each weight adds its input, subtracts it or skips it.
 After every block, a per-block lens (a small readout fitted with `research/scripts/tuned_lens.py`) shows the
 picture the painter has in mind at that point.
 
-## One file, under a gigabyte
+## One file, about a gigabyte
 
 The labs run the whole pipeline above, because they show all of it. Painting alone needs less.
 [mindview-t2i-turbo](https://huggingface.co/mohsenvand/mindview-t2i-turbo) is the same kind of pipeline packed into one
-file of 990 MB, and [`/paint`](https://neovand.github.io/mindview/paint) runs it: type a prompt, get a picture. On a
-MacBook Air (M4) in Chrome a picture takes about 5 s in one step (Instant), 7 s in two (Fast) and 16 s in four (Best).
+file of 1,063 MB, and [`/paint`](https://neovand.github.io/mindview/paint) runs it: type a prompt, get a picture. On a
+MacBook Air (M4) in Chrome a picture takes about 4 s in one step (Instant), 6 s in two (Fast) and 15 s in four (Best).
 [mindview-t2i](https://huggingface.co/mohsenvand/mindview-t2i) is the earlier file, without the 1-step branch.
 
 - **The reader keeps 9 of its 28 layers.** A sweep over which reader layers to tap
@@ -47,10 +47,12 @@ MacBook Air (M4) in Chrome a picture takes about 5 s in one step (Instant), 7 s 
 - **Two steps, the first at a quarter of the size.** Fast sketches its first step at 256 × 256 with the first 128 text
   rows, upsamples that step's guess of the clean picture in latent space, noises it back and paints the second step at
   512 × 512: a third less time, the same pictures (`research/scripts/progressive.py`, `progressive_rows.py`).
-- **One step from EPFL's RDM.** [epfl-vita/flux2-klein-1step-rdm](https://huggingface.co/epfl-vita/flux2-klein-1step-rdm)
-  distils klein to one step with a full fine-tune. Its change to the 100 big matrices carries over to the ternary
-  painter at rank 4 (10 MB), with the modulation recomputed from its time weights at σ = 1
-  (`research/scripts/rdm_delta.py`, `rdm_test.py`, `rdm_rank.py`).
+- **One step, trained on the ternary painter.** [epfl-vita/flux2-klein-1step-rdm](https://huggingface.co/epfl-vita/flux2-klein-1step-rdm)
+  distils klein to one step with a full fine-tune. Its change carries over to the ternary painter at rank 4, with the
+  modulation recomputed at σ = 1, but softly and with defects (`rdm_delta.py`, `rdm_test.py`, `rdm_rank.py`). So a
+  rank-32 branch is trained on the ternary painter with RDM on klein as the teacher: LPIPS on TAEF2-decoded pictures,
+  2,000 prompts, 3,000 steps on one H100, about 25 minutes (`research/scripts/distill_1step.py`,
+  `research/cloud/distill_modal.py`). Plain mean squared error made it blurrier.
 - **Ternary weights are stored 5 to a byte** (1.6 bits each). Tensors are deflated wherever that saves anything, and
   the browser inflates them. The file is read with range requests, in parts, so it is never all in memory at once.
 
@@ -61,7 +63,7 @@ MacBook Air (M4) in Chrome a picture takes about 5 s in one step (Instant), 7 s 
 | The painter                        | 761.3 MB |
 | The decoder                        | 2.5 MB   |
 | The few-step LoRA (rank 8)         | 20.8 MB  |
-| The 1-step branch (rank 4)         | 9.8 MB   |
+| The 1-step branch (rank 32)        | 82.7 MB  |
 | Schedules for 1–4 steps and RDM's  | 2.1 MB   |
 
 To rebuild it (after `research/scripts/adapter.py targets`, which runs the stock encoder over the prompts):
@@ -72,11 +74,13 @@ research/.venv/bin/python research/scripts/adapter_layers.py fit
 research/.venv/bin/python research/scripts/adapter_layers.py final 3 6 9
 research/.venv/bin/python research/scripts/pack_model.py --fused research/data/adapter/fused_final_layers_3_6_9.pt --float \
   --lora <radames/FLUX.2-klein-Sana-Sprint's pytorch_lora_weights.safetensors> --lora-rank 8 \
-  --rdm research/data/rdm/rdm_lora_r256.safetensors --rdm-rank 4
+  --rdm research/data/distill/rdm_trained_r32.safetensors --rdm-rank 32
 ```
 
-The 1-step branch needs `research/scripts/rdm_delta.py` (RDM minus klein, as rank-256 SVDs) and
-`export_painter_schedules.py` (the `1r` schedule) first.
+The 1-step branch needs, first: `research/scripts/rdm_delta.py` (RDM minus klein, as rank-256 SVDs), the training
+(`distill_1step.py prepare`, then `modal run research/cloud/distill_modal.py --step upload|fetch|targets|train|pull`,
+then `distill_1step.py export 32`), and `RDM_STUDENT=research/data/distill/student_r32.pt
+export_painter_schedules.py` (the `1r` schedule with the trained offsets).
 
 What makes it fast in the browser: an f16 ternary GEMM (tiles staged and multiplied in f16, summed in f32), attention in
 f16, the text stream cut to what the prompt needs, and a register-tiled decoder. `/dev/gemm`, `/dev/profile` and

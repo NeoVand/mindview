@@ -15,7 +15,7 @@ const READER_HUB =
 	'https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/983b5dec2ff16aab79990711ba0f828a499a7e6a/Ternary-Bonsai-1.7B-Q2_0.gguf';
 const PAINTER_HUB = 'https://huggingface.co/mohsenvand/mindview-painter/resolve/main';
 const PACKED_HUB =
-	'https://huggingface.co/mohsenvand/mindview-t2i-turbo/resolve/f8be0ede949d85fa6c8a523ba3f5702b74e87c50/mindview-t2i-turbo.gguf';
+	'https://huggingface.co/mohsenvand/mindview-t2i-turbo/resolve/010bf1bdb18e1818998355bb8d358d96f1d93ab7/mindview-t2i-turbo.gguf';
 
 /** The reader's GGUF file. */
 export function readerUrl(): string {

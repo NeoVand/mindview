@@ -2,7 +2,7 @@
 
     modal run research/cloud/distill_modal.py --step upload     # cond.pt, init.pt (make them with `prepare`)
     modal run research/cloud/distill_modal.py --step fetch      # the source models, into the volume (CPU only)
-    modal run research/cloud/distill_modal.py --step targets --n 2000
+    modal run research/cloud/distill_modal.py --step targets --n 2000 --k 3   # 3 noises per prompt
     modal run research/cloud/distill_modal.py --step train --steps 3000 --rank 32 --batch 4
     modal run research/cloud/distill_modal.py --step pull       # checkpoint and held-out pictures, back here
 
@@ -52,7 +52,7 @@ def run(args: list[str]):
 
 
 @app.local_entrypoint()
-def main(step: str, n: int = 2000, steps: int = 3000, rank: int = 32, batch: int = 4, lr: float = 5e-5):
+def main(step: str, n: int = 2000, k: int = 1, steps: int = 3000, rank: int = 32, batch: int = 4, lr: float = 5e-5):
     if step == 'upload':
         with vol.batch_upload(force=True) as up:
             for f in ('cond.pt', 'init.pt'):
@@ -60,7 +60,7 @@ def main(step: str, n: int = 2000, steps: int = 3000, rank: int = 32, batch: int
     elif step == 'fetch':
         fetch.remote()
     elif step == 'targets':
-        run.remote(['targets', str(n)])
+        run.remote(['targets', str(n), str(k)])
     elif step == 'train':
         run.remote(['train', str(steps), str(rank), str(batch), str(lr)])
     elif step == 'pull':

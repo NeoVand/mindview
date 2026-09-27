@@ -15,7 +15,7 @@ Both see the conditioning the browser gives: Ternary Bonsai 1.7B's layers 3, 6, 
 The 12 calibration prompts are held out and painted as training goes (renders/distill/h<i>_<label>.png).
 
     python scripts/distill_1step.py prepare            # locally: the map (cond.pt) and the branch's start (init.pt)
-    python scripts/distill_1step.py targets N          # N prompts from adapter_train.txt: conditioning, teacher x0
+    python scripts/distill_1step.py targets N [K]      # N prompts from adapter_train.txt, K noises each: teacher x0
     python scripts/distill_1step.py train STEPS [R] [B] [LR]  # train (resumes from student_rR.pt), batch B
     python scripts/distill_1step.py export [R]         # the branch for pack_model.py --rdm
 
@@ -234,7 +234,8 @@ def taef2():
 
 # ---- the steps
 @torch.no_grad()
-def targets(n):
+def targets(n, k=1):
+    """n prompts, k noises each (sample p * k + j has seed 1000 + p * k + j); the held-out prompts follow."""
     prompts = [line.strip() for line in open(f'{SCRIPTS}/../data/prompts/adapter_train.txt') if line.strip()][:n]
     held = [line.strip() for line in open(f'{SCRIPTS}/../data/calibration_prompts.txt') if line.strip()]
     t0 = time.time()
@@ -242,18 +243,21 @@ def targets(n):
     print(f'conditioning: {time.time() - t0:.0f}s', flush=True)
     pipe = base_pipe()
     tr = teacher()
+    prompt_of = torch.cat([torch.arange(n).repeat_interleave(k), n + torch.arange(len(held))])
+    seeds = 1000 + torch.arange(len(prompt_of))
     xs = []
-    for i in range(0, len(ctx), 4):
-        j = min(len(ctx), i + 4)
-        z, ids = noise(range(1000 + i, 1000 + j), pipe)
-        xs.append(x0(tr, z, ids, ctx[i:j], pipe).half().cpu())
-        if i % 200 == 0:
-            print(f'teacher {i}/{len(ctx)} {time.time() - t0:.0f}s', flush=True)
+    for i in range(0, len(prompt_of), 4):
+        j = min(len(prompt_of), i + 4)
+        z, ids = noise(seeds[i:j].tolist(), pipe)
+        xs.append(x0(tr, z, ids, ctx[prompt_of[i:j]], pipe).half().cpu())
+        if i % 800 == 0:
+            print(f'teacher {i}/{len(prompt_of)} {time.time() - t0:.0f}s', flush=True)
     xs = torch.cat(xs)
-    torch.save(dict(prompts=prompts, ctx=ctx[:n], x0=xs[:n]), f'{D}/train.pt')
-    torch.save(dict(prompts=held, ctx=ctx[n:], x0=xs[n:]), f'{D}/held.pt')
+    m = n * k
+    torch.save(dict(prompts=prompts, ctx=ctx[:n], x0=xs[:m], seeds=seeds[:m], prompt_of=prompt_of[:m]), f'{D}/train.pt')
+    torch.save(dict(prompts=held, ctx=ctx[n:], x0=xs[m:], seeds=seeds[m:]), f'{D}/held.pt')
     for i in range(len(held)):
-        decode(pipe, xs[n + i:n + i + 1].float().to(dev)).save(f'renders/distill/h{i}_teacher.png')
+        decode(pipe, xs[m + i:m + i + 1].float().to(dev)).save(f'renders/distill/h{i}_teacher.png')
     print('saved', len(prompts), 'training prompts and', len(held), 'held out', f'{time.time() - t0:.0f}s', flush=True)
 
 
@@ -261,10 +265,13 @@ def train(steps, rank, batch=1, lr=5e-5, mse_weight=0.05):
     import lpips
     tr_data = torch.load(f'{D}/train.pt')
     held = torch.load(f'{D}/held.pt')
-    n = len(tr_data['prompts'])
+    n = len(tr_data['x0'])  # samples (a prompt and a noise each)
+    seeds = tr_data.get('seeds', 1000 + torch.arange(n))
+    prompt_of = tr_data.get('prompt_of', torch.arange(n))
+    held_seeds = held.get('seeds', 1000 + n + torch.arange(len(held['prompts'])))
     pipe = base_pipe()
     path = f'{D}/student_r{rank}.pt'
-    state = torch.load(path) if os.path.exists(path) else None
+    state = torch.load(path, map_location='cpu', weights_only=False) if os.path.exists(path) else None
     tr, branches, offsets = student(rank, state)
     tr.enable_gradient_checkpointing()
     dec = taef2()
@@ -286,7 +293,7 @@ def train(steps, rank, batch=1, lr=5e-5, mse_weight=0.05):
         err = []
         with torch.no_grad():
             for i in range(len(held['prompts'])):
-                z, ids = noise([1000 + n + i], pipe)
+                z, ids = noise([int(held_seeds[i])], pipe)
                 xs = x0(tr, z, ids, held['ctx'][i:i + 1], pipe)
                 xt = held['x0'][i:i + 1].float().to(dev)
                 err.append(percept(pixels(xs), pixels(xt)).mean().item())
@@ -295,25 +302,33 @@ def train(steps, rank, batch=1, lr=5e-5, mse_weight=0.05):
         tr.train()
         return sum(err) / len(err)
 
-    def save(s):
-        torch.save(dict(step=s, rank=rank, opt=opt.state_dict(),
+    def save(s, to=path):
+        torch.save(dict(step=s, rank=rank, opt=opt.state_dict(), best=best,
                         branches={k: dict(A=b.A.data.cpu(), B=b.B.data.cpu()) for k, b in branches.items()},
-                        offsets={k: o.d.data.cpu() for k, o in offsets.items()}), path)
+                        offsets={k: o.d.data.cpu() for k, o in offsets.items()}), to)
 
+    best = state.get('best', 1e9) if state else 1e9
     if not state:
-        print(f'held-out LPIPS before training: {held_eval("start"):.4f}', flush=True)
+        best = held_eval('start')
+        print(f'held-out LPIPS before training: {best:.4f}', flush=True)
+    base_lrs = [g['lr'] for g in opt.param_groups]
+    total = start + steps
     tr.train()
     t0, log = time.time(), []
     for s in range(start, start + steps):
         # a fresh order every pass over the prompts
         order = torch.randperm(n, generator=torch.Generator().manual_seed((s * batch) // n))
         idx = [int(order[(s * batch + k) % n]) for k in range(batch)]
-        z, ids = noise([1000 + i for i in idx], pipe)
-        xs = x0(tr, z, ids, tr_data['ctx'][idx], pipe)
+        z, ids = noise([int(seeds[i]) for i in idx], pipe)
+        xs = x0(tr, z, ids, tr_data['ctx'][prompt_of[idx]], pipe)
         xt = tr_data['x0'][idx].float().to(dev)
         with torch.no_grad():
             target = pixels(xt)
         loss = percept(pixels(xs), target).mean() + mse_weight * ((xs - xt) ** 2).mean()
+        # cosine decay to a tenth over this run
+        f = float(0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * (s - start) / max(1, total - start))))
+        for g, b in zip(opt.param_groups, base_lrs):
+            g['lr'] = b * f
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -322,15 +337,19 @@ def train(steps, rank, batch=1, lr=5e-5, mse_weight=0.05):
             print(f'step {s + 1}: loss {sum(log[-10:]) / 10:.4f}, {(time.time() - t0) / (s + 1 - start):.2f}s/step',
                   flush=True)
         if (s + 1) % 250 == 0 or s + 1 == start + steps:
-            save(s + 1)
             paint = (s + 1) % 500 == 0 or s + 1 == start + steps
-            print(f'step {s + 1}: held-out LPIPS {held_eval(f"s{s + 1}" if paint else None):.4f}', flush=True)
+            h = held_eval(f's{s + 1}' if paint else None)
+            print(f'step {s + 1}: held-out LPIPS {h:.4f}', flush=True)
+            if h < best:  # the best on the held-out prompts is kept apart
+                best = h
+                save(s + 1, f'{D}/student_r{rank}_best.pt')
+            save(s + 1)
 
 
 def export(rank):
     """The trained branch as a LoRA file for pack_model.py --rdm (and the offsets for export_painter_schedules.py)."""
     from safetensors.torch import save_file
-    st = torch.load(f'{D}/student_r{rank}.pt')
+    st = torch.load(f'{D}/student_r{rank}.pt', map_location='cpu', weights_only=False)
     out = {}
     for name, ab in st['branches'].items():
         out[f'transformer.{name}.lora_A.weight'] = ab['A'].to(torch.bfloat16).contiguous()
@@ -347,7 +366,7 @@ if __name__ == '__main__':
     if cmd == 'prepare':
         prepare()
     elif cmd == 'targets':
-        targets(int(a[0]))
+        targets(int(a[0]), int(a[1]) if len(a) > 1 else 1)
     elif cmd == 'train':
         train(int(a[0]), int(a[1]) if len(a) > 1 else 32, int(a[2]) if len(a) > 2 else 1,
               float(a[3]) if len(a) > 3 else 5e-5)

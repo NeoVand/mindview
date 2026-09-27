@@ -74,7 +74,7 @@ if os.path.exists(RDM_OTHER) and KLEIN:
                           r_out.linear(r_out.silu(temb)).reshape(-1, 2, D)], 1)
     # a 1-step branch trained on the ternary painter (distill_1step.py) also learns offsets to this modulation
     if os.environ.get('RDM_STUDENT'):
-        off = torch.load(os.environ['RDM_STUDENT'])['offsets']
+        off = torch.load(os.environ['RDM_STUDENT'], map_location='cpu', weights_only=False)['offsets']
         rows = rows + torch.cat([off['double_stream_modulation_img'].reshape(6, D), off['double_stream_modulation_txt'].reshape(6, D),
                                  off['single_stream_modulation'].reshape(3, D), off['norm_out.linear'].reshape(2, D)])[None]
         print('1r: with the trained offsets of', os.environ['RDM_STUDENT'])
