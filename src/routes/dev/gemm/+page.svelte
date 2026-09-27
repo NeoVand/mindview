@@ -22,13 +22,15 @@
 	];
 	const extra = Number(page.url.searchParams.get('rows') ?? 0);
 	const rank = Number(page.url.searchParams.get('lora') ?? 0); // also time a side branch of this rank
+	// ?kinds=old,fast,fast32,f16 picks the kernels (f16: 32-input chunks)
+	const kinds = (page.url.searchParams.get('kinds') ?? 'old,fast,f16').split(',');
 	if (extra)
 		SHAPES.push([extra - 1024, 3072, 3072, 0], [extra, 27648, 3072, 0], [extra, 3072, 12288, 0]);
 
 	async function run() {
 		const device = await labDevice();
 		const lines: string[] = [];
-		const total = { old: 0, fast: 0, lora: 0 };
+		const total: Record<string, number> = {};
 		for (const [M, N, K, per] of SHAPES) {
 			status = `${M} x ${N} x ${K}`;
 			const codes = new Uint32Array((N * K) / 16);
@@ -60,11 +62,20 @@
 			const lBuf = mk(Bt, GPUBufferUsage.STORAGE);
 			const base: GemmJob = { M, N, K, codes: 0, scales: 0, x: 0, y: M * K };
 			const out: Record<string, string> = {};
-			for (const kind of ['old', 'fast', ...(rank ? (['lora'] as const) : [])] as const) {
-				const gemm = new TernaryGemm(device, cBuf, sBuf, arena, 4, kind === 'old' ? 0 : 16, lBuf);
+			for (const kind of [...kinds, ...(rank ? ['lora', 'lora16'] : [])]) {
+				const gemm = new TernaryGemm(
+					device,
+					cBuf,
+					sBuf,
+					arena,
+					4,
+					kind === 'old' ? 0 : kind.endsWith('32') ? 32 : 16,
+					lBuf
+				);
+				gemm.precision = kind.startsWith('f16') || kind === 'lora16' ? 'f16' : 'f32';
 				const job: GemmJob = {
 					...base,
-					...(kind === 'lora' ? { lora: { t: M * K + M * N, b: 0, rank } } : {})
+					...(kind.startsWith('lora') ? { lora: { t: M * K + M * N, b: 0, rank } } : {})
 				};
 				gemm.prepare([job]);
 				const time = async (n: number) => {
@@ -80,7 +91,7 @@
 				await time(2);
 				const reps = Math.max(3, Math.round(4e11 / (2 * M * N * K)));
 				const ms = (await time(reps)) / reps;
-				total[kind] += ms * per;
+				total[kind] = (total[kind] ?? 0) + ms * per;
 				const rd = device.createBuffer({
 					size: M * N * 4,
 					usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
@@ -90,7 +101,8 @@
 				device.queue.submit([enc.finish()]);
 				await rd.mapAsync(GPUMapMode.READ);
 				const Y = new Float32Array(rd.getMappedRange());
-				let worst = 0;
+				let worst = 0,
+					ss = 0; // the largest error, and the sum of squares of the references (the error is reported relative to their rms)
 				for (let q = 0; q < 48; q++) {
 					const m = Math.floor(Math.random() * M),
 						n = Math.floor(Math.random() * N);
@@ -99,23 +111,29 @@
 						const t = ((codes[(n * K + k) >> 4] >>> ((k % 16) * 2)) & 3) - 1;
 						ref += t * scales[(n * K + k) >> 7] * X[m * K + k];
 					}
-					if (kind === 'lora')
+					if (kind.startsWith('lora'))
 						for (let j = 0; j < rank; j++) ref += T[m * rank + j] * Bt[j * N + n];
-					worst = Math.max(worst, Math.abs(ref - Y[m * N + n]) / (Math.abs(ref) + 1e-3));
+					worst = Math.max(worst, Math.abs(ref - Y[m * N + n]));
+					ss += ref * ref;
 				}
 				rd.unmap();
+				worst /= Math.sqrt(ss / 48);
 				rd.destroy();
 				out[kind] =
 					`${ms.toFixed(2).padStart(7)} ms ${((2 * M * N * K) / ms / 1e9).toFixed(2).padStart(5)} TFLOP/s err ${worst.toExponential(0)}`;
 			}
 			lines.push(
-				`${`${M}x${N}x${K}`.padEnd(18)} x${String(per).padEnd(3)} old ${out.old} | fast ${out.fast}${rank ? ` | +lora ${out.lora}` : ''}`
+				`${`${M}x${N}x${K}`.padEnd(18)} x${String(per).padEnd(3)} ${Object.entries(out)
+					.map(([k, v]) => `${k} ${v}`)
+					.join(' | ')}`
 			);
 			for (const b of [cBuf, sBuf, arena, lBuf]) b.destroy();
 		}
 		lines.push(
 			'',
-			`ternary GEMMs of one step: old ${total.old.toFixed(0)} ms, fast ${total.fast.toFixed(0)} ms (${(total.old / total.fast).toFixed(2)}x)${rank ? `, with a rank-${rank} branch ${total.lora.toFixed(0)} ms` : ''}`
+			`ternary GEMMs of one step: ${Object.entries(total)
+				.map(([k, ms]) => `${k} ${ms.toFixed(0)} ms`)
+				.join(', ')}`
 		);
 		report = lines.join('\n');
 		status = 'done';

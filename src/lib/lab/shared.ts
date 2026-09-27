@@ -22,14 +22,17 @@ function makeDevice(): Promise<GPUDevice> {
 			);
 		const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
 		if (!adapter) throw new Error('No WebGPU adapter is available on this machine.');
-		const requiredFeatures: GPUFeatureName[] = adapter.features.has('timestamp-query')
-			? ['timestamp-query']
-			: [];
+		// timestamps for profiling; f16 for the painter's fast GEMM
+		const requiredFeatures = (['timestamp-query', 'shader-f16'] as GPUFeatureName[]).filter((f) =>
+			adapter.features.has(f)
+		);
 		const dev = await adapter.requestDevice({
 			requiredFeatures,
 			requiredLimits: {
 				maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
 				maxBufferSize: adapter.limits.maxBufferSize,
+				// the default is 16 KB; the painter's GEMM tiles use up to 32 KB where the GPU has it
+				maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
 				maxStorageBuffersPerShaderStage: Math.min(
 					16,
 					adapter.limits.maxStorageBuffersPerShaderStage

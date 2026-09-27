@@ -438,6 +438,13 @@ export class Painter {
 	steps = 4;
 	/** A few-step LoRA as side branches of the DiT's ternary matrices (from the one-file model), and whether it is on. */
 	private lora?: PainterLora;
+	/** The ternary GEMMs' arithmetic: 'f16' (the default where the GPU has it: about 1.4x) or 'f32'. */
+	get precision() {
+		return this.gemm.precision;
+	}
+	set precision(p: 'f32' | 'f16') {
+		this.gemm.precision = p;
+	}
 	/** On with 1 or 2 steps when the model has the few-step LoRA (setSteps); off otherwise. */
 	useLora = false;
 	get hasLora() {

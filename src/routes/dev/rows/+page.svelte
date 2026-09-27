@@ -1,6 +1,6 @@
 <script lang="ts">
 	// The one-file model painting the same prompts several ways, side by side, with the time of each painting. Each
-	// column is steps/text rows: ?cols=4/512,4/auto,2/auto (1 or 2 steps turn the few-step LoRA on when the file has
+	// column is steps/text rows[/precision]: ?cols=4/512,4/auto/f32,2/auto (1 or 2 steps turn the few-step LoRA on when the file has
 	// it). ?file= picks a file in static/models/mindview-t2i/ instead of the default model.
 	import { asset } from '$app/paths';
 	import { page } from '$app/state';
@@ -23,8 +23,12 @@
 	const q = page.url.searchParams;
 	const lengths = (q.get('cols') ?? '4/512,4/auto').split(',');
 	const parse = (c: string) => {
-		const [steps, rows] = c.split('/');
-		return { steps: Number(steps), rows: rows === 'auto' ? ('auto' as const) : Number(rows) };
+		const [steps, rows, precision] = c.split('/');
+		return {
+			steps: Number(steps),
+			rows: rows === 'auto' ? ('auto' as const) : Number(rows),
+			precision: (precision ?? 'f16') as 'f32' | 'f16'
+		};
 	};
 	const file = q.get('file');
 	const seed = Number(q.get('seed') ?? 7);
@@ -59,8 +63,9 @@
 		for (const p of PROMPTS)
 			for (const l of lengths) {
 				status = `${l}: ${p}`;
-				const { steps, rows } = parse(l);
+				const { steps, rows, precision } = parse(l);
 				painter.textLength = rows;
+				painter.precision = precision;
 				painter.setSteps(steps);
 				const t0 = performance.now();
 				await painter.encode(llm, p);

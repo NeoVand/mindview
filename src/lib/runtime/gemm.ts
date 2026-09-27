@@ -93,13 +93,39 @@ const FAST_FMA = Array.from(
 	(_, i) =>
 		`${acc(i, 0)} += a${i >> 2}.${'xyzw'[i & 3]} * b0; ${acc(i, 1)} += a${i >> 2}.${'xyzw'[i & 3]} * b1;`
 ).join('\n      ');
+// f16: products and partial sums (one K-chunk) in f16, then added into the f32 accumulators
+const part = (i: number, c: number) => `p${i}${c}`;
+const FAST16_PART = Array.from({ length: 8 }, (_, i) => [0, 1].map((c) => part(i, c)))
+	.flat()
+	.map((v) => `var ${v} = vec4<f16>(0.0h);`)
+	.join(' ');
+const FAST16_FMA = Array.from(
+	{ length: 8 },
+	(_, i) =>
+		`${part(i, 0)} = fma(vec4<f16>(a${i >> 2}.${'xyzw'[i & 3]}), b0, ${part(i, 0)}); ${part(i, 1)} = fma(vec4<f16>(a${i >> 2}.${'xyzw'[i & 3]}), b1, ${part(i, 1)});`
+).join('\n      ');
+const FAST16_FLUSH = Array.from({ length: 16 }, (_, q) => [q >> 1, q & 1])
+	.map(([i, c]) => `${acc(i, c)} += vec4f(${part(i, c)}); ${part(i, c)} = vec4<f16>(0.0h);`)
+	.join('\n    ');
 const FAST_OUT = Array.from(
 	{ length: 8 },
 	(_, i) => `put(${i}u, ${acc(i, 0)}, ${acc(i, 1)});`
 ).join(' ');
 
 /** The fast kernel for a K-chunk of BK inputs (16 or 32: workgroup memory holds 2 x BK x 128 floats). */
-export const gemmFastWGSL = (BK: 16 | 32) => /* wgsl */ `
+/**
+ * The fast kernel for K-chunks of BK inputs. With f16, X and W are staged in workgroup memory as f16 and multiplied in
+ * f16, each chunk summed in f16 and added into f32 (W = trit x scale is exact in f16, the scales being f16): about 1.7x
+ * the f32 kernel on Apple GPUs, whose workgroup memory is the bottleneck. Needs shader-f16 (and BK 32 needs the 32 KB
+ * workgroup storage limit in f32, 16 KB in f16).
+ */
+export const gemmFastWGSL = (BK: 16 | 32, f16 = false) => {
+	const T = f16 ? 'vec4<f16>' : 'vec4f';
+	const st = (v: string) => (f16 ? `vec4<f16>(${v})` : v);
+	const fma = f16 ? FAST16_FMA : FAST_FMA;
+	const flush = f16 ? FAST16_FLUSH : '';
+	return /* wgsl */ `
+${f16 ? 'enable f16;' : ''}
 struct G { M: u32, N: u32, K: u32, codes: u32, scales: u32, x: u32, y: u32, bias: u32, flags: u32, lt: u32, lb: u32, lr: u32 };
 @group(0) @binding(0) var<uniform> U: G;
 @group(0) @binding(1) var<storage, read> CODES: array<u32>;
@@ -110,8 +136,8 @@ struct G { M: u32, N: u32, K: u32, codes: u32, scales: u32, x: u32, y: u32, bias
 const BM = ${FAST.BM}u;
 const BN = ${FAST.BN}u;
 const BK = ${BK}u;
-var<workgroup> As: array<vec4f, ${(BK * FAST.BM) / 4}>; // [BK][BM / 4]
-var<workgroup> Bs: array<vec4f, ${(BK * FAST.BN) / 4}>; // [BK][BN / 4]
+var<workgroup> As: array<${T}, ${(BK * FAST.BM) / 4}>; // [BK][BM / 4]
+var<workgroup> Bs: array<${T}, ${(BK * FAST.BN) / 4}>; // [BK][BN / 4]
 var<private> m0: u32;
 var<private> n0: u32;
 var<private> tx: u32;
@@ -140,6 +166,7 @@ fn gemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
   ty = lid / 16u;
   let K = U.K;
   ${FAST_ACC}
+  ${f16 ? FAST16_PART : ''}
   for (var k0 = 0u; k0 < K; k0 += BK) {
     // each thread writes whole vec4s (a component write to shared memory is a read-modify-write of the vector)
     if (lid < 128u) {
@@ -159,7 +186,7 @@ fn gemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
           t[o] = (vec4f(f32(b & 3u), f32((b >> 2u) & 3u), f32((b >> 4u) & 3u), f32((b >> 6u) & 3u)) - 1.0) * s;
         }
         for (var e = 0u; e < 4u; e++) {
-          Bs[(4u * kq + e) * 32u + g] = vec4f(t[0][e], t[1][e], t[2][e], t[3][e]);
+          Bs[(4u * kq + e) * 32u + g] = ${st('vec4f(t[0][e], t[1][e], t[2][e], t[3][e])')};
         }
       }
     } else {
@@ -174,7 +201,7 @@ fn gemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
           if (m < U.M) { v[o] = A[(U.x + m * K + k0) / 4u + kq]; }
         }
         for (var e = 0u; e < 4u; e++) {
-          As[(4u * kq + e) * 32u + rb] = vec4f(v[0][e], v[1][e], v[2][e], v[3][e]);
+          As[(4u * kq + e) * 32u + rb] = ${st('vec4f(v[0][e], v[1][e], v[2][e], v[3][e])')};
         }
       }
     }
@@ -184,9 +211,10 @@ fn gemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
       let a1 = As[kk * 32u + ty * 2u + 1u];
       let b0 = Bs[kk * 32u + tx * 2u];
       let b1 = Bs[kk * 32u + tx * 2u + 1u];
-      ${FAST_FMA}
+      ${fma}
     }
     workgroupBarrier();
+    ${flush}
   }
   // a low-rank side branch (a LoRA), as more inputs: T = X A^T [M][rank] (computed before) times B^T [rank][N]
   for (var r0 = 0u; r0 < U.lr; r0 += BK) {
@@ -197,7 +225,7 @@ fn gemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
           let k = 4u * kq + e;
           var b = vec4f(0.0);
           if (n0 + 4u * g < U.N) { b = LB[(U.lb + (r0 + k) * U.N + n0) / 4u + g]; }
-          Bs[k * 32u + g] = b;
+          Bs[k * 32u + g] = ${st('b')};
         }
       }
     } else {
@@ -211,7 +239,7 @@ fn gemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
           if (m < U.M) { v[o] = A[(U.lt + m * U.lr + r0) / 4u + kq]; }
         }
         for (var e = 0u; e < 4u; e++) {
-          As[(4u * kq + e) * 32u + rb] = vec4f(v[0][e], v[1][e], v[2][e], v[3][e]);
+          As[(4u * kq + e) * 32u + rb] = ${st('vec4f(v[0][e], v[1][e], v[2][e], v[3][e])')};
         }
       }
     }
@@ -221,12 +249,14 @@ fn gemm(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
       let a1 = As[kk * 32u + ty * 2u + 1u];
       let b0 = Bs[kk * 32u + tx * 2u];
       let b1 = Bs[kk * 32u + tx * 2u + 1u];
-      ${FAST_FMA}
+      ${fma}
     }
     workgroupBarrier();
+    ${flush}
   }
   ${FAST_OUT}
 }`;
+};
 
 /** Whether a job can take the fast path (vec4 access: offsets and N multiples of 4; K in whole code words). */
 export function gemmFastOk(j: GemmJob) {
@@ -261,6 +291,10 @@ export interface GemmJob {
 export class TernaryGemm {
 	private pipe: GPUComputePipeline;
 	private fast: GPUComputePipeline | null;
+	private fast16: GPUComputePipeline | null;
+	/** 'f16' stages and multiplies in f16 and accumulates in f32 (about 1.4x, relative error about 2e-3); 'f32' is
+	 * exact to rounding. f16 is the default where the device has shader-f16. */
+	precision: 'f32' | 'f16';
 	private lora: GPUBuffer;
 	private layout: GPUBindGroupLayout;
 	private params: GPUBuffer;
@@ -311,6 +345,20 @@ export class TernaryGemm {
 					}
 				})
 			: null;
+		const f16 = !!fastBK && device.features.has('shader-f16');
+		this.fast16 = f16
+			? device.createComputePipeline({
+					layout: device.createPipelineLayout({ bindGroupLayouts: [this.layout] }),
+					compute: {
+						module: device.createShaderModule({
+							label: 'ternary gemm (fast, f16)',
+							code: gemmFastWGSL(32, true)
+						}),
+						entryPoint: 'gemm'
+					}
+				})
+			: null;
+		this.precision = f16 ? 'f16' : 'f32';
 		this.params = device.createBuffer({
 			size: capacity * 256,
 			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
@@ -364,7 +412,7 @@ export class TernaryGemm {
 	dispatch(pass: GPUComputePassEncoder, slot: number, job: GemmJob) {
 		pass.setBindGroup(0, this.bind, [slot * 256]);
 		if (this.fast && gemmFastOk(job)) {
-			pass.setPipeline(this.fast);
+			pass.setPipeline(this.precision === 'f16' && this.fast16 ? this.fast16 : this.fast);
 			pass.dispatchWorkgroups(Math.ceil(job.N / FAST.BN), Math.ceil(job.M / FAST.BM));
 		} else {
 			if (job.lora)
