@@ -24,6 +24,9 @@
 	let painted = $state(false);
 	let result = $state('');
 	let error = $state<string | null>(null);
+	// fast: 2 steps with the few-step LoRA (when the model has it); best: 4 steps
+	let mode = $state<'fast' | 'best'>('fast');
+	let fastAvailable = $state(false);
 	let canvas: HTMLCanvasElement | undefined;
 	let device: GPUDevice | undefined;
 
@@ -61,6 +64,7 @@
 			const { megabytes } = await load();
 			if (!alive) return;
 			ready = true;
+			fastAvailable = (await load()).painter.hasLora;
 			progress = null;
 			status = `The model is ready (${megabytes} MB, one file). Type something and paint it.`;
 		})().catch((e) => {
@@ -102,13 +106,16 @@
 		try {
 			const { llm, painter } = await load();
 			const t0 = performance.now();
+			const steps = fastAvailable && mode === 'fast' ? 2 : 4;
+			painter.setSteps(steps);
+			// at 2 steps the pads matter more: keep 256 text rows (4 steps need only the prompt and a few)
+			painter.textLength = steps === 2 ? 256 : 'auto';
 			status = 'Reading your words';
 			await painter.encode(llm, text);
 			painter.setNoise(undefined, seed);
-			for (let s = 0; s < 4; s++) {
-				await painter.step(s, (_, b) => {
-					if (b >= 0 && b < 25) status = `Painting: step ${s + 1} of 4, block ${b + 1} of 25`;
-				});
+			for (let s = 0; s < steps; s++) {
+				status = `Painting: step ${s + 1} of ${steps}`;
+				await painter.step(s);
 				// what it has in mind after this step (after the last: the picture itself)
 				await painter.decode(painter.sigmas[s + 1]);
 				await show(painter);
@@ -185,6 +192,16 @@
 					<input type="number" min="0" step="1" bind:value={seed} disabled={painting} />
 				</label>
 				<button type="button" onclick={newSeed} disabled={!ready || painting}>New seed</button>
+				{#if fastAvailable}
+					<div class="mode" role="radiogroup" aria-label="Speed">
+						<label class:on={mode === 'fast'}>
+							<input type="radio" bind:group={mode} value="fast" disabled={painting} />Fast, 2 steps
+						</label>
+						<label class:on={mode === 'best'}>
+							<input type="radio" bind:group={mode} value="best" disabled={painting} />Best, 4 steps
+						</label>
+					</div>
+				{/if}
 			</div>
 		</form>
 
@@ -333,6 +350,27 @@
 	input:focus-visible {
 		outline: 1px solid var(--ember);
 		outline-offset: 2px;
+	}
+	.mode {
+		display: flex;
+		border: 1px solid rgb(232 226 214 / 0.25);
+	}
+	.mode label {
+		padding: 0.35rem 0.7rem;
+		cursor: pointer;
+		opacity: 0.6;
+	}
+	.mode label.on {
+		opacity: 1;
+		background: rgb(232 226 214 / 0.1);
+	}
+	.mode label:has(input:focus-visible) {
+		outline: 1px solid var(--ember);
+	}
+	.mode input {
+		position: absolute;
+		opacity: 0;
+		pointer-events: none;
 	}
 	.status {
 		min-height: 3.2rem;
