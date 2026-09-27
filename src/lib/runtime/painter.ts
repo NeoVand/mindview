@@ -127,6 +127,41 @@ fn lens_x0(@builtin(global_invocation_id) g: vec3u) {
   A[U.e + (c * 64u + 2u * h + dy) * 64u + 2u * w + dx] = A[U.d + i] - U.fa * (A[U.b + i] + WD[U.c + ch]);
 }
 
+// After a step: its clean guess x0 = lat - sigma' v (lat already moved on to sigma'), unpatchified into TAEF2's layout
+// [32][2G][2G]. a=values (G * G * 128), b=vel, d=lat, e=x0 out, f=G (patches a side), fa=sigma'
+@compute @workgroup_size(256)
+fn x0_unpatch(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= U.a) { return; }
+  let t = i / 128u; let ch = i % 128u;
+  let h = t / U.f; let w = t % U.f;
+  let c = ch / 4u; let dy = (ch % 4u) / 2u; let dx = ch % 2u;
+  let side = 2u * U.f;
+  A[U.e + (c * side + 2u * h + dy) * side + 2u * w + dx] = A[U.d + i] - U.fa * A[U.b + i];
+}
+
+// After a first step at 16 x 16 patches: its clean guess (b: [32][32][32], from x0_unpatch) enlarged to 32 x 32 patches,
+// bilinear per channel as torch's interpolate(scale 2, align_corners=False), into e ([32][64][64], TAEF2's layout: the
+// sketch) and, mixed back with noise c ([1024][128]) to sigma fa, into the latent d ([1024][128]). a=1024 * 128
+@compute @workgroup_size(256)
+fn upsample_sketch(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= U.a) { return; }
+  let t = i / 128u; let ch = i % 128u;
+  let c = ch / 4u;
+  let y = 2u * (t / 32u) + (ch % 4u) / 2u; let x = 2u * (t % 32u) + ch % 2u;
+  let sy = (f32(y) + 0.5) * 0.5 - 0.5; let sx = (f32(x) + 0.5) * 0.5 - 0.5;
+  let y0 = floor(sy); let x0 = floor(sx);
+  let fy = sy - y0; let fx = sx - x0;
+  let ya = u32(clamp(y0, 0.0, 31.0)); let yb = u32(clamp(y0 + 1.0, 0.0, 31.0));
+  let xa = u32(clamp(x0, 0.0, 31.0)); let xb = u32(clamp(x0 + 1.0, 0.0, 31.0));
+  let base = U.b + c * 1024u;
+  let v = (1.0 - fy) * ((1.0 - fx) * A[base + ya * 32u + xa] + fx * A[base + ya * 32u + xb])
+        + fy * ((1.0 - fx) * A[base + yb * 32u + xa] + fx * A[base + yb * 32u + xb]);
+  A[U.e + (c * 64u + y) * 64u + x] = v;
+  A[U.d + i] = (1.0 - U.fa) * v + U.fa * A[U.c + i];
+}
+
 // How much each image patch attends to each prompt word (mean over heads) in the last attention.
 // a=image tokens, b=words, c=probabilities [heads][joint][joint], d=joint index of the first word, e=out [a][b],
 // f=joint index of the first image token, g=joint length, h=heads
@@ -261,11 +296,27 @@ type Kernel =
 	| 'euler'
 	| 'dgemm'
 	| 'lens_x0'
+	| 'x0_unpatch'
+	| 'upsample_sketch'
 	| 'attn_words'
 	| 'row_mean'
 	| 'row_project'
 	| 'attn_pool'
 	| 'copy_rows';
+/** Seeded Gaussian noise (LCG + Box-Muller), as setNoise and upsampleLatent make it. */
+function gaussian(n: number, seed: number): Float32Array {
+	const z = new Float32Array(n);
+	let r = seed >>> 0 || 1;
+	const rnd = () => ((r = (r * 1664525 + 1013904223) >>> 0) + 0.5) / 4294967296;
+	for (let i = 0; i < n; i += 2) {
+		const m = Math.sqrt(-2 * Math.log(rnd())),
+			th = 2 * Math.PI * rnd();
+		z[i] = m * Math.cos(th);
+		z[i + 1] = m * Math.sin(th);
+	}
+	return z;
+}
+
 /** The rope table's rows for a 16 x 16 patch grid (a first step at 256 x 256): rows 512 + 32 h + w of the full one. */
 function rope16(full: Float32Array): Float32Array {
 	const out = new Float32Array(256 * 64);
@@ -440,6 +491,16 @@ export class Painter {
 	private get nj() {
 		return this.nt + this.ni;
 	}
+
+	/** A step's shape: image rows (256 for a first step at 256 x 256, see setNoise), text rows, joint rows. */
+	private dims(s: number) {
+		const ni = this.lowFirst && s === 0 ? 256 : NI;
+		const nt = ni === NI ? this.nt : Math.min(this.nt, this.lowTextRows);
+		return { ni, nt, nj: nt + ni, grid: ni === NI ? 32 : 16 };
+	}
+	/** Whether the painting's first step runs at 256 x 256 (setNoise with low). */
+	private lowFirst = false;
+	private seed = 7;
 	/** Image rows of the current step: 1024 (32 x 32 patches, 512 x 512) or 256 (16 x 16, a first step at 256 x 256). */
 	private ni = NI;
 	/** Text rows for a first step at 256 x 256 (setNoise with low): a multiple of 64. */
@@ -600,6 +661,8 @@ export class Painter {
 			'euler',
 			'dgemm',
 			'lens_x0',
+			'x0_unpatch',
+			'upsample_sketch',
 			'attn_words',
 			'row_mean',
 			'row_project',
@@ -943,6 +1006,8 @@ export class Painter {
 	 */
 	setNoise(noise?: Float32Array, seed = 7, low = false) {
 		this.ni = low ? 256 : NI;
+		this.lowFirst = low;
+		this.seed = seed;
 		let z = noise;
 		if (!z) {
 			z = new Float32Array(this.ni * CIN);
@@ -1039,10 +1104,8 @@ export class Painter {
 	private stepOps(s: number, tap?: Tap, pool?: (b: number, ops: Op[]) => void) {
 		const at = this.at,
 			mod = at.mod + s * 17 * D,
-			ni = this.ni,
 			// a first step at 256 x 256 reads a prefix of the text rows (the reader is causal: the same rows)
-			nt = ni === NI ? this.nt : Math.min(this.nt, this.lowTextRows),
-			nj = nt + ni;
+			{ ni, nt, nj } = this.dims(s);
 		// image rows turn by the rope table's rows for (h, w): the full table's 512.. at 32 x 32, a 16 x 16 copy at 256
 		const ropeImg: [string, string, number] =
 			ni === NI ? ['rope.cos', 'rope.sin', ROPE_IMG] : ['rope.cos16', 'rope.sin16', 0];
@@ -1334,7 +1397,9 @@ export class Painter {
 			const n = Math.min(R, rows - r0);
 			if (o.k === 'gemm') {
 				const j = o.job;
-				out.push({ k: 'gemm', job: { ...j, M: n, x: j.x + r0 * j.K, y: j.y + r0 * j.N } });
+				// a side branch's A x ([M][rank]) moves with the rows too
+				const lora = j.lora && { ...j.lora, t: j.lora.t + r0 * j.lora.rank };
+				out.push({ k: 'gemm', job: { ...j, M: n, x: j.x + r0 * j.K, y: j.y + r0 * j.N, lora } });
 				continue;
 			}
 			if (o.k === 'dense') {
@@ -1512,11 +1577,20 @@ export class Painter {
 	): GpuTask[] {
 		const { ops, hooks } = this.stepOps(s);
 		const tasks: GpuTask[] = [];
+		const lens = this.hasLens && this.taef2.hasEarly;
 		let from = 0;
 		for (const [to, b] of hooks) {
 			tasks.push(...this.tasks(ops.slice(from, to), budget));
 			from = to;
 			if (b < 0 && onInput && this.hasSpace) tasks.push(this.inputTask(onInput));
+			// without a lens there is no picture per block: when the step is done, its own clean guess is decoded (a
+			// first step at 256 x 256 is enlarged and noised back for the next, see sketchTasks)
+			if (b === 25 && !lens)
+				tasks.push(
+					...(this.lowFirst && s === 0
+						? this.sketchTasks(stage, budget)
+						: this.guessTasks(s, stage, budget))
+				);
 			if (b < 0 || b > 24) continue;
 			tasks.push(
 				this.readoutTask(
@@ -1527,9 +1601,79 @@ export class Painter {
 					onPicture && ((enc) => onPicture(enc, b))
 				)
 			);
-			if (b === 24) tasks.push(...this.taef2.decodeTasks(budget, stage));
+			if (b === 24 && lens) tasks.push(...this.taef2.decodeTasks(budget, stage));
 		}
 		return tasks;
+	}
+
+	/** After step s (full size): its clean guess, x0 = lat - sigma' v, through TAEF2 (stages as in stepTasks). */
+	private guessTasks(
+		s: number,
+		stage: { record?: (enc: GPUCommandEncoder, res: number) => void; done?: (res: number) => void },
+		budget = 9
+	): GpuTask[] {
+		const at = this.at;
+		const op: Op = {
+			k: 'kernel',
+			name: 'x0_unpatch',
+			p: [NI * CIN, at.vel, 0, at.lat, at.x0, 32],
+			f: [this.sigmas[s + 1] ?? 0],
+			wg: [(NI * CIN) / 256, 1, 1]
+		};
+		return [
+			{
+				cost: 1,
+				record: (enc, sub) => {
+					this.record([op], enc, sub);
+					this.taef2.copyLatent(enc, this.arena, at.x0);
+				}
+			},
+			...this.taef2.decodeTasks(budget, stage)
+		];
+	}
+
+	/**
+	 * After a first step at 256 x 256 (setNoise with low): its clean guess enlarged to 512 x 512 in the latent space and
+	 * mixed with fresh noise back to the next sigma, as the next step's latent (all on the GPU, as upsampleLatent does
+	 * on the CPU); the enlarged guess, the sketch, goes through TAEF2 (stages as in stepTasks).
+	 */
+	sketchTasks(
+		stage: { record?: (enc: GPUCommandEncoder, res: number) => void; done?: (res: number) => void },
+		budget = 9
+	): GpuTask[] {
+		const at = this.at,
+			s1 = this.sigmas[1];
+		const ops: Op[] = [
+			{
+				k: 'kernel',
+				name: 'x0_unpatch',
+				p: [256 * CIN, at.vel, 0, at.lat, at.vl, 16],
+				f: [s1],
+				wg: [(256 * CIN) / 256, 1, 1]
+			},
+			{
+				k: 'kernel',
+				name: 'upsample_sketch',
+				p: [NI * CIN, at.vl, at.noise, at.lat, at.x0],
+				f: [s1],
+				wg: [(NI * CIN) / 256, 1, 1]
+			}
+		];
+		return [
+			{
+				cost: 1,
+				record: (enc, sub) => {
+					this.device.queue.writeBuffer(
+						this.arena,
+						at.noise * 4,
+						gaussian(NI * CIN, this.seed + 1)
+					);
+					this.record(ops, enc, sub);
+					this.taef2.copyLatent(enc, this.arena, at.x0);
+				}
+			},
+			...this.taef2.decodeTasks(budget, stage)
+		];
 	}
 
 	/** Read the painter's states back on the drawing space after each block (see BlockSpace); off unless wanted. */
@@ -1581,28 +1725,29 @@ export class Painter {
 		onPicture?: (enc: GPUCommandEncoder) => void
 	): GpuTask {
 		const at = this.at,
-			count = words.count;
+			count = words.count,
+			{ ni, nt: ntj, nj } = this.dims(s);
 		const ops: Op[] = [];
 		// the states after this block, projected on the drawing space: every image patch, and the prompt's real rows
 		// (from row 3; each group less its own mean)
 		const space = this.hasSpace;
-		const nt = Math.max(1, this.textRows - 3);
+		const nt = Math.max(1, Math.min(this.textRows, ntj) - 3);
 		if (space) {
-			const img = at.h + this.nt * D,
+			const img = at.h + ntj * D,
 				txt = at.h + 3 * D;
 			ops.push(
-				{ k: 'kernel', name: 'row_mean', p: [NI, D, img, at.mu], wg: [D / 256, 1, 1] },
+				{ k: 'kernel', name: 'row_mean', p: [ni, D, img, at.mu], wg: [D / 256, 1, 1] },
 				{
 					k: 'kernel',
 					name: 'row_project',
 					p: [0, D, img, at.proj, at.mu, this.w('viz.space_img')],
-					wg: [NI, 1, 1]
+					wg: [ni, 1, 1]
 				},
 				{ k: 'kernel', name: 'row_mean', p: [nt, D, txt, at.mu + D], wg: [D / 256, 1, 1] },
 				{
 					k: 'kernel',
 					name: 'row_project',
-					p: [0, D, txt, at.proj + NI * 4, at.mu + D, this.w('viz.space_txt')],
+					p: [0, D, txt, at.proj + ni * 4, at.mu + D, this.w('viz.space_txt')],
 					wg: [nt, 1, 1]
 				}
 			);
@@ -1613,37 +1758,37 @@ export class Painter {
 			ops.push({
 				k: 'kernel',
 				name: 'dgemm',
-				p: [NI, CIN, D, at.h + this.nt * D, D, 0, L, CIN, 0, at.vl, CIN, 0, 3],
+				p: [ni, CIN, D, at.h + ntj * D, D, 0, L, CIN, 0, at.vl, CIN, 0, 3],
 				f: [1],
-				wg: [CIN / 64, NI / 64, 1]
+				wg: [CIN / 64, ni / 64, 1]
 			});
 			ops.push({
 				k: 'kernel',
 				name: 'lens_x0',
-				p: [NI * CIN, at.vl, L + 3072 * CIN, at.lat, at.x0],
+				p: [ni * CIN, at.vl, L + 3072 * CIN, at.lat, at.x0],
 				f: [this.sigmas[s]],
-				wg: [(NI * CIN) / 256, 1, 1]
+				wg: [(ni * CIN) / 256, 1, 1]
 			});
 		}
 		ops.push({
 			k: 'kernel',
 			name: 'attn_words',
-			p: [NI, count, at.s, words.first, at.aw, this.nt, this.nj, H],
-			wg: [NI / 64, count, 1]
+			p: [ni, count, at.s, words.first, at.aw, ntj, nj, H],
+			wg: [ni / 64, count, 1]
 		});
 		// and how the words read each other in this block: [word][word], averaged over the heads
 		const nW = Math.min(count, 128);
 		ops.push({
 			k: 'kernel',
 			name: 'attn_words',
-			p: [nW, nW, at.s, words.first, at.awt, words.first, this.nj, H],
+			p: [nW, nW, at.s, words.first, at.awt, words.first, nj, H],
 			wg: [Math.ceil(nW / 64), nW, 1]
 		});
 		let out: GPUBuffer;
 		// read back: attention [NI][count], then (with the space) projections [NI + nt][4], then the quick picture
 		// as rgba floats [64 * 64][4] (the patches' colours)
-		const nA = NI * count,
-			nP = space ? (NI + nt) * 4 : 0,
+		const nA = ni * count,
+			nP = space ? (ni + nt) * 4 : 0,
 			nC = space && lens ? 64 * 64 * 4 : 0,
 			nT = nW * nW;
 		return {
@@ -1672,8 +1817,8 @@ export class Painter {
 					all.subarray(0, nA),
 					nP
 						? {
-								img: all.subarray(nA, nA + NI * 4),
-								txt: all.subarray(nA + NI * 4, nA + nP),
+								img: all.subarray(nA, nA + ni * 4),
+								txt: all.subarray(nA + ni * 4, nA + nP),
 								colours: nC ? all.subarray(nA + nP, nA + nP + nC) : null
 							}
 						: undefined,
