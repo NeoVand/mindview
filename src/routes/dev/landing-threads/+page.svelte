@@ -1,40 +1,43 @@
 <script lang="ts">
-	import { labGPU, labModel, labPainter, releasePainting } from '$lib/lab/shared';
+	// The landing, being built: the threads piece on the one-file turbo model (Fast: a sketch, then the picture).
+	// Nothing runs until the visitor starts it; the prompt can be changed at any time (Enter starts again).
+	import { labGPU } from '$lib/lab/shared';
+	import { turboModel, turboPainter, turboReader, type TurboProgress } from '$lib/landing/turbo';
 	import { Threads, type ThreadsStatus } from '$lib/viz/threads';
 
 	let study: Threads | undefined;
-	let loading = $state('Starting the graphics card');
-	let progress = $state(0);
-	let ready = $state(false);
-	let error = $state<string | null>(null);
+	let canvas: HTMLCanvasElement | undefined;
+	let stage = $state<'intro' | 'loading' | 'journey'>('intro');
 	let prompt = $state('a bonsai tree made of glowing circuitry in a dark museum, volumetric light');
-	let status = $state<ThreadsStatus | null>(null);
+	let error = $state<string | null>(null);
+	let loading = $state('');
+	let progress = $state(0);
 	let painterNote = $state('');
-	// the journey timeline: how far the computation has got, and where the camera is
+	let status = $state<ThreadsStatus | null>(null);
 	let front = $state(0);
 	let ride = $state(0);
-	let total = $state(28);
+	let total = $state(9);
 	let marks = $state<number[]>([]);
 	let mode = $state('live');
 	let done = $state(false);
 	let scrubbing = false;
-	// painting options (they apply to the next painting; 'Paint again' repaints with them)
-	let steps = $state(4);
-	let seed = $state(7);
-	let stepChoices = $state([1, 2, 3, 4, 6, 8, 12]);
-	let hasPainter = $state(false);
+	const mb = (x: number) => Math.round(x).toLocaleString();
 
-	function scrub(e: PointerEvent) {
-		const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		study?.rideTo(((e.clientX - box.left) / box.width) * total);
+	function onProgress(p: TurboProgress) {
+		if (p.stage === 'reader') {
+			progress = p.megabytes / p.total;
+			loading = `Downloading the reader: ${mb(p.megabytes)} of ${mb(p.total)} MB. Your browser keeps the model after the first time.`;
+		} else
+			painterNote =
+				p.fraction < 1 ? `The painter is downloading: ${mb(p.megabytes)} of ${mb(p.total)} MB` : '';
 	}
 
-	function mount(canvas: HTMLCanvasElement) {
-		let alive = true;
+	function mount(c: HTMLCanvasElement) {
+		canvas = c;
 		let drag: { x: number; y: number; id: number } | null = null;
 		const down = (e: PointerEvent) => {
 			drag = { x: e.clientX, y: e.clientY, id: e.pointerId };
-			canvas.setPointerCapture(e.pointerId);
+			c.setPointerCapture(e.pointerId);
 		};
 		const move = (e: PointerEvent) => {
 			if (!drag || !study || e.pointerId !== drag.id) return;
@@ -44,84 +47,75 @@
 		};
 		const up = () => (drag = null);
 		const wheel = (e: WheelEvent) => {
+			if (!study) return;
 			e.preventDefault();
-			study?.zoom(Math.exp(e.deltaY * 0.0015));
+			study.zoom(Math.exp(e.deltaY * 0.0015));
 		};
-		canvas.addEventListener('pointerdown', down);
-		canvas.addEventListener('pointermove', move);
-		canvas.addEventListener('pointerup', up);
-		canvas.addEventListener('pointercancel', up);
-		canvas.addEventListener('wheel', wheel, { passive: false });
+		c.addEventListener('pointerdown', down);
+		c.addEventListener('pointermove', move);
+		c.addEventListener('pointerup', up);
+		c.addEventListener('pointercancel', up);
+		c.addEventListener('wheel', wheel, { passive: false });
+		return () => {
+			c.removeEventListener('pointerdown', down);
+			c.removeEventListener('pointermove', move);
+			c.removeEventListener('pointerup', up);
+			c.removeEventListener('pointercancel', up);
+			c.removeEventListener('wheel', wheel);
+			study?.destroy();
+			study = undefined;
+		};
+	}
 
-		(async () => {
-			// the same device and reader as the other labs (kept when moving between them)
+	async function begin() {
+		if (!canvas) return;
+		if (study) {
+			study.read(prompt.trim());
+			return;
+		}
+		stage = 'loading';
+		loading = 'Starting the graphics card';
+		try {
 			const gpu = await labGPU(canvas);
-			loading = 'Loading Ternary Bonsai 1.7B (460 MB)';
-			const llm = await labModel(gpu.device, (f) => (progress = f));
-			if (!alive) return;
-			study = new Threads(gpu, llm, (s) => {
-				if (s.caption !== status?.caption || s.busy !== status?.busy) status = s;
-				front = s.front ?? front;
-				ride = s.ride ?? ride;
-				total = s.total ?? total;
-				marks = s.marks ?? marks;
-				mode = s.mode ?? mode;
-				done = s.done ?? done;
-			});
+			const model = await turboModel();
+			const llm = await turboReader(gpu.device, onProgress);
+			study = new Threads(
+				gpu,
+				llm,
+				(s) => {
+					if (s.caption !== status?.caption || s.busy !== status?.busy) status = s;
+					front = s.front ?? front;
+					ride = s.ride ?? ride;
+					total = s.total ?? total;
+					marks = s.marks ?? marks;
+					mode = s.mode ?? mode;
+					done = s.done ?? done;
+				},
+				model
+			);
 			if (import.meta.env.DEV) (window as unknown as { threads: Threads }).threads = study;
-			ready = true;
-			// the painter (1.1 GB) downloads while the reader runs; the journey continues into it when it is ready
+			stage = 'journey';
 			painterNote = 'The painter is downloading';
-			labPainter(gpu.device, (p) => {
-				painterNote =
-					p.fraction < 1 ? `The painter is downloading: ${Math.round(p.fraction * 100)}%` : '';
-			})
+			turboPainter(gpu.device, onProgress)
 				.then((p) => {
 					painterNote = '';
-					stepChoices = p.stepChoices;
-					hasPainter = true;
-					// the labs' shared painting uses the same painter: it stops while Threads paints
-					releasePainting();
-					if (alive) study?.attachPainter(p);
+					study?.attachPainter(p);
 				})
 				.catch(
 					(e) => (painterNote = `The painter could not load: ${e instanceof Error ? e.message : e}`)
 				);
-			await study.read(prompt);
-		})().catch((e) => (error = e instanceof Error ? e.message : String(e)));
-
-		return () => {
-			alive = false;
-			canvas.removeEventListener('pointerdown', down);
-			canvas.removeEventListener('pointermove', move);
-			canvas.removeEventListener('pointerup', up);
-			canvas.removeEventListener('pointercancel', up);
-			canvas.removeEventListener('wheel', wheel);
-			study?.destroy();
-		};
-	}
-
-	function apply() {
-		if (study) study.options = { steps, seed };
+			await study.read(prompt.trim());
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
 	}
 
 	function submit(e?: SubmitEvent) {
 		e?.preventDefault();
-		apply();
-		if (study && prompt.trim()) study.read(prompt.trim());
+		if (prompt.trim()) begin();
 	}
 
-	function repaint() {
-		apply();
-		study?.repaint();
-	}
-
-	function newSeed() {
-		seed = Math.floor(Math.random() * 1e6);
-		repaint();
-	}
-
-	/** Enter paints; Shift+Enter starts a new line. */
+	/** Enter starts; Shift+Enter starts a new line. */
 	function promptKey(e: KeyboardEvent) {
 		if (e.key === 'Enter' && !e.shiftKey) {
 			e.preventDefault();
@@ -129,64 +123,62 @@
 		}
 	}
 
+	function scrub(e: PointerEvent) {
+		const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		study?.rideTo(((e.clientX - box.left) / box.width) * total);
+	}
+
 	function onkeydown(e: KeyboardEvent) {
 		const tag = (e.target as HTMLElement)?.tagName;
-		if (!study || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON')
-			return;
+		if (!study || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
 		if (e.key === ' ') {
 			study.paused = !study.paused;
 			e.preventDefault();
-		} else if (e.key === 'ArrowRight') study.seek(e.shiftKey ? 10 : 2);
-		else if (e.key === 'ArrowLeft') study.seek(e.shiftKey ? -10 : -2);
+		}
 	}
 </script>
 
-<svelte:head><title>Threads</title></svelte:head>
+<svelte:head><title>mindview</title></svelte:head>
 <svelte:window {onkeydown} />
 
-<main>
+<main class:intro={stage === 'intro'}>
 	<canvas
 		{@attach mount}
-		aria-label="Your words as threads travelling through the model's 28 layers; drag to turn, scroll to zoom"
+		aria-label="Your words as threads through the reader's layers, then the painter; drag to turn, scroll to zoom"
 	></canvas>
+
+	<form onsubmit={submit} class:start={stage === 'intro'}>
+		{#if stage === 'intro'}
+			<p class="lede">
+				Type something. A language model reads it, a diffusion model paints it, here in this tab,
+				and you watch every layer do it.
+			</p>
+		{/if}
+		<textarea
+			bind:value={prompt}
+			onkeydown={promptKey}
+			rows="1"
+			aria-label="What to paint; Enter to begin, Shift+Enter for a new line"
+			spellcheck="false"></textarea>
+		{#if stage === 'intro'}
+			<div class="go">
+				<button type="submit" disabled={!prompt.trim()}>Read and paint</button>
+				<span class="size"
+					>The model is about 1 GB, downloaded once and kept by your browser. It runs on your
+					graphics card.</span
+				>
+			</div>
+		{/if}
+	</form>
+
 	{#if error}
 		<p class="note" role="alert">{error}</p>
-	{:else if !ready}
+	{:else if stage === 'loading'}
 		<div class="note">
 			<p>{loading}</p>
 			<div class="bar"><span style:transform="scaleX({progress})"></span></div>
 		</div>
-	{:else}
-		<form onsubmit={submit}>
-			<textarea
-				bind:value={prompt}
-				onkeydown={promptKey}
-				rows="1"
-				aria-label="Type something for the model to read and paint; Enter to begin, Shift+Enter for a new line"
-				spellcheck="false"></textarea>
-			<div class="options">
-				<label>
-					Passes
-					<select bind:value={steps} onchange={repaint} disabled={!hasPainter}>
-						{#each stepChoices as n (n)}
-							<option value={n}>{n}</option>
-						{/each}
-					</select>
-				</label>
-				<label>
-					Seed
-					<input
-						type="number"
-						bind:value={seed}
-						min="0"
-						onchange={repaint}
-						disabled={!hasPainter}
-					/>
-				</label>
-				<button type="button" onclick={newSeed} disabled={!hasPainter}>New seed</button>
-				<span class="size">512 × 512 pixels</span>
-			</div>
-		</form>
+	{:else if stage === 'journey'}
 		<p class="caption" aria-live="polite">{status?.caption ?? ''}</p>
 		{#if painterNote}<p class="aside">{painterNote}</p>{/if}
 		<div class="journey">
@@ -209,8 +201,7 @@
 			>
 				<span class="done" style:transform="scaleX({front / total})"></span>
 				{#each marks as m, i (i)}
-					<span class="tick" class:major={m > 28 || m % 7 === 0} style:left="{(m / total) * 100}%"
-					></span>
+					<span class="tick" style:left="{(m / total) * 100}%"></span>
 				{/each}
 				<span class="here" style:left="{(ride / total) * 100}%"></span>
 			</div>
@@ -251,7 +242,23 @@
 		position: absolute;
 		left: 6vw;
 		top: 5vh;
-		width: min(46rem, 80vw);
+		width: min(46rem, 88vw);
+		transition:
+			top 0.8s ease,
+			transform 0.8s ease;
+	}
+	form.start {
+		top: 50%;
+		transform: translateY(-60%);
+	}
+	.lede {
+		margin: 0 0 1.4rem;
+		max-width: 34rem;
+		font-weight: 300;
+		font-size: clamp(1rem, 1.3vw, 1.15rem);
+		line-height: 1.5;
+		color: var(--bone);
+		opacity: 0.7;
 	}
 	textarea {
 		display: block;
@@ -268,41 +275,30 @@
 		padding: 0.3rem 0;
 		outline: none;
 	}
+	form.start textarea {
+		font-size: clamp(1.6rem, 3.2vw, 3rem);
+	}
 	textarea:focus-visible {
 		border-bottom-color: var(--ember);
 	}
-	.options {
+	.go {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
-		gap: 1.2rem;
-		margin-top: 0.6rem;
+		gap: 1.2rem 1.6rem;
+		margin-top: 1.6rem;
+	}
+	.go button {
+		font-size: 1.05rem;
+		padding: 0.55rem 1.3rem;
+		border-color: var(--ember);
+	}
+	.size {
+		max-width: 26rem;
 		font-size: 0.85rem;
+		line-height: 1.45;
 		color: var(--bone);
-		opacity: 0.7;
-	}
-	.options label {
-		display: flex;
-		align-items: center;
-		gap: 0.45rem;
-	}
-	.options select,
-	.options input {
-		background: none;
-		color: var(--bone);
-		border: none;
-		border-bottom: 1px solid rgb(232 226 214 / 0.25);
-		font: inherit;
-		padding: 0.1rem 0.2rem;
-	}
-	.options input {
-		width: 6.5rem;
-	}
-	.options option {
-		background: #101010;
-	}
-	.options .size {
-		opacity: 0.6;
+		opacity: 0.5;
 	}
 	.caption,
 	.note {
@@ -371,10 +367,6 @@
 		height: 6px;
 		background: rgb(232 226 214 / 0.25);
 	}
-	.tick.major {
-		top: calc(50% - 6px);
-		height: 12px;
-	}
 	.here {
 		position: absolute;
 		top: 50%;
@@ -393,6 +385,10 @@
 		padding: 0.3rem 0.8rem;
 		cursor: pointer;
 	}
+	button:disabled {
+		opacity: 0.4;
+		cursor: default;
+	}
 	button:focus-visible {
 		outline: 1px solid var(--ember);
 	}
@@ -407,5 +403,10 @@
 		height: 100%;
 		background: var(--ember);
 		transform-origin: left;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		form {
+			transition: none;
+		}
 	}
 </style>

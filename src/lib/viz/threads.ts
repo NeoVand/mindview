@@ -1,4 +1,4 @@
-// Live study: threads. Every word of the prompt is a thread falling through the 28 layers of Ternary Bonsai 1.7B.
+// Live study: threads. Every word of the prompt is a thread falling through the layers of Ternary Bonsai 1.7B.
 // A layer moves a word by the sum of (a) attention: one contribution per head and earlier word, P[h,t,s] * Wo_h v_s,
 // and (b) the MLP: one contribution per neuron, act_j * Wdown[:, j]. The thread is drawn through that sum term by term,
 // projected onto two fixed directions of meaning-space: height is how far through the sum we are, the sideways
@@ -19,6 +19,25 @@ import { ImagePlanes } from './planes';
 
 type V3 = [number, number, number];
 
+/** What the model is: the layers the painter listens to (the reader runs up to the last), and sizes for the captions. */
+export interface ThreadsModel {
+	taps: number[];
+	readerWeights: string; // e.g. '1.4 billion'
+	painterWeights: string;
+	textRows: number; // rows the painter's text side is padded to
+	/** Fast: 2 passes, the first a sketch at 256 x 256 (the one-file model with its few-step LoRA). */
+	fast: boolean;
+}
+
+/** The lab's models: the 1.7B read to layer 21 and the painter bundle. */
+export const LAB_MODEL: ThreadsModel = {
+	taps: [7, 14, 21],
+	readerWeights: '1.4 billion',
+	painterWeights: '3.7 billion',
+	textRows: 512,
+	fast: false
+};
+
 export interface ThreadsStatus {
 	caption: string;
 	busy: boolean;
@@ -27,6 +46,7 @@ export interface ThreadsStatus {
 	total?: number; // length of the journey in units (28 layers, then the painter)
 	marks?: number[]; // where layers and painting steps begin, in units
 	mode?: string;
+	done?: boolean; // the picture is finished
 }
 
 const WORLD = 5; // radius of the bundle in world units
@@ -36,10 +56,10 @@ const GAP = 5; // world length of the handoff from reader to painter
 const NEURON_STRIDE = 4; // draw every 4th neuron's running total
 const TICK_LEN = 3.2; // world length of one painter tick before a painting has laid its columns out
 const HANDOFF = 2; // journey units taken by the handoff
+const PAINT_RATE = 1.7; // painter ticks shown per second (a tick is a block, or a stage of the decoder)
 const OTHER = 250,
 	PLATE = 251,
 	TAP_PLATE = 252; // palette slots
-const TAP_LAYERS = [7, 14, 21]; // where the painter listens: the words as they stand after these layers
 
 // Project every column of a ternary matrix onto two directions of the residual stream: out[j] = E^T W[:, j]
 const PROJECT_WGSL = /* wgsl */ `
@@ -117,11 +137,13 @@ export class Threads {
 	private reading = false;
 	private readId = 0;
 	private quiet = 0; // 0..1: the finished picture on its own (lines dimmed, since they run straight at the camera)
+	private far = 0; // 0..1: the whole journey seen from far away (lines dimmed)
 
 	constructor(
 		private gpu: GPU,
 		private llm: BonsaiLLM,
-		private onStatus: (s: ThreadsStatus) => void
+		private onStatus: (s: ThreadsStatus) => void,
+		readonly model: ThreadsModel = LAB_MODEL
 	) {
 		const { device } = gpu;
 		this.post = new Post(gpu);
@@ -169,14 +191,15 @@ export class Threads {
 			this.gpu.device,
 			this.frame,
 			this.planes,
-			{ x0: x0 + GAP, readerEnd: x0, layers: this.layers },
+			{ x0: x0 + GAP, readerEnd: x0, layers: this.layers, taps: this.model.taps },
 			this.palette,
 			this.wordCount,
-			this.options.steps
+			this.model.fast ? 2 : this.options.steps,
+			this.model.fast
 		);
 		this.painting = painting;
 		try {
-			const taps = this.threadPos.map((ps) => [ps[7], ps[14], ps[21]]);
+			const taps = this.threadPos.map((ps) => this.model.taps.map((l) => ps[l]));
 			painting.start(this.painter, this.llm, this.scheduler, this.prompt, taps, this.options.seed);
 		} catch (err) {
 			this.paintError = err instanceof Error ? err.message : String(err);
@@ -269,6 +292,15 @@ export class Threads {
 		this.idle = 0;
 	}
 
+	/** The finished picture, face on (or back to riding along while it is still being made). */
+	showPicture() {
+		if (!this.painting?.done) return this.follow();
+		this.ride = this.front;
+		this.mode = 'finale';
+		this.modeTime = 0;
+		this.idle = 0;
+	}
+
 	seek(dt: number) {
 		if (this.mode === 'manual' || this.mode === 'overview' || this.mode === 'rewind') {
 			this.rideTo(this.ride + dt / 2);
@@ -298,8 +330,9 @@ export class Threads {
 			HD = c.headDim,
 			KV = c.kvHeads * HD,
 			Q = H * HD;
-		// the painter uses the words only as they stand after layer 21, so the reader stops there
-		const NL = TAP_LAYERS[2],
+		// the painter uses the words only as they stand after its last tap, so the reader stops there
+		const TAP_LAYERS = this.model.taps;
+		const NL = TAP_LAYERS[TAP_LAYERS.length - 1],
 			G = H / c.kvHeads;
 		// the reading is long JavaScript work: give frames a turn every few milliseconds, and stop if a newer
 		// prompt has come in meanwhile (breathe() then returns true)
@@ -622,7 +655,7 @@ export class Threads {
 				);
 			strand++;
 		}
-		// beads where the painter will take each word: its place after layers 7, 14 and 21
+		// beads where the painter will take each word: its place after the tapped layers
 		for (const l of TAP_LAYERS)
 			for (let i = 0; i < nw; i++) {
 				const p = threadPos[i][l];
@@ -792,10 +825,11 @@ export class Threads {
 			const target = this.painting.done
 				? this.painting.ticksTotal
 				: Math.max(0, this.painting.ticks - 1);
-			this.paintFront = Math.min(
-				target,
-				this.paintFront + dt * Math.max(1.5, (target - this.paintFront) * 2)
-			);
+			// a steady, readable pace (one block every ~0.6 s), never ahead of what has been computed; when the
+			// computation is far ahead (a fast painter), a little quicker, so the picture is not kept waiting long
+			const lag = target - this.paintFront;
+			const rate = PAINT_RATE * (1 + Math.max(0, lag - TICKS_PER_STEP) / TICKS_PER_STEP);
+			this.paintFront = Math.min(target, this.paintFront + dt * rate);
 		}
 		const front = this.front;
 		// the ride
@@ -808,9 +842,6 @@ export class Threads {
 					this.mode = this.painting?.done ? 'finale' : 'overview';
 					this.modeTime = 0;
 				}
-			} else if (this.mode === 'finale' && this.modeTime > 9) {
-				this.mode = 'overview';
-				this.modeTime = 0;
 			} else if (this.mode === 'rewind') {
 				this.ride = Math.max(0, this.ride - (dt * total) / 70);
 				if (this.ride <= 0) {
@@ -850,12 +881,12 @@ export class Threads {
 		if (this.mode === 'overview') {
 			const a = this.xAt(0),
 				z = this.painting ? this.painting.finalAt[0] + 14 : this.xAt(total);
-			// nearly side on, so the whole journey runs across the screen, turning very slowly
+			// nearly side on and a little from above, so the whole journey runs across the screen, turning very slowly
 			want = {
-				c: [(a + z) / 2, 1, 0],
-				dist: (z - a) * 1.0,
-				yaw: 0.3 + 0.12 * Math.sin(this.modeTime * 0.05),
-				pitch: 0.22
+				c: [(a + z) / 2, 2, 0],
+				dist: (z - a) * 0.92,
+				yaw: 0.18 + 0.08 * Math.sin(this.modeTime * 0.05),
+				pitch: 0.3
 			};
 		}
 		if (prog < 1 && this.mode === 'live') want.dist = Math.max(10, fit * 0.85);
@@ -899,7 +930,10 @@ export class Threads {
 		this.threads.now = shownLayers;
 		this.threads.width = 0.9;
 		this.quiet += ((this.mode === 'finale' ? 1 : 0) - this.quiet) * (1 - Math.exp(-dt * 2));
-		const lineGain = 1 - 0.92 * this.quiet;
+		// seen whole from far away, the lines crowd into few pixels and add up: dim them
+		const far = this.mode === 'overview' && this.painting ? 1 : 0;
+		this.far += (far - this.far) * (1 - Math.exp(-dt * 2));
+		const lineGain = (1 - 0.92 * this.quiet) * (1 - 0.7 * this.far);
 		this.threads.gain = 0.9 * lineGain;
 		this.threads.fresh = 3;
 		this.links.now = shownLayers;
@@ -997,38 +1031,47 @@ export class Threads {
 			const passes = this.painting?.steps ?? this.options.steps;
 			if (this.paintError) caption = `The painter stopped: ${this.paintError}`;
 			else if (this.mode === 'finale')
-				caption = `Your words, painted: 1.4 billion ternary weights read them, 3.7 billion turned noise into this in ${passes} ${passes === 1 ? 'pass' : 'passes'}, all in this browser tab.`;
+				caption = `Your words, painted: ${this.model.readerWeights} ternary weights read them, ${this.model.painterWeights} turned noise into this in ${passes} ${passes === 1 ? 'pass' : 'passes'}, all in this browser tab.`;
 			else if (this.mode === 'overview')
 				caption = this.painting?.done
-					? `The whole journey: 1.4 billion weights read your ${this.wordCount} words, 3.7 billion painted them. Drag to turn, scroll to come closer, or drag along the timeline to go back.`
-					: `All ${NL} layers: 1.4 billion weights moved your ${this.wordCount} words, left to right. Drag to turn, scroll to come closer, or drag along the timeline to go back.`;
+					? `The whole journey: ${this.model.readerWeights} weights read your ${this.wordCount} words, ${this.model.painterWeights} painted them. Drag to turn, scroll to come closer, or drag along the timeline to go back.`
+					: `All ${NL} layers: ${this.model.readerWeights} weights moved your ${this.wordCount} words, left to right. Drag to turn, scroll to come closer, or drag along the timeline to go back.`;
 			else if ((this.mode === 'rewind' || this.mode === 'manual') && !inPainter)
 				caption = `Looking back at layer ${at} of ${NL}. Each jagged step is the sum of everything that layer added to the word.`;
 			else if (this.ride >= NL && this.ride - NL - HANDOFF < 0.5)
 				caption = this.painter
-					? `The reading stops after layer 21: the painter needs nothing later. It takes each word as it stood after layers 7, 14 and 21 (the beads); the 1.7B reads the prompt once more, padded to the 512 rows the painter expects, and here the adapter merges each word's three states into one (${Math.round((this.painting?.encoded ?? 0) * 100)}%).`
+					? `The reading stops after layer ${NL}: the painter needs nothing later. It takes each word as it stood after layers ${listed(this.model.taps)} (the beads); the reader reads the prompt once more, padded to the ${this.model.textRows} rows the painter expects, and here a linear map merges each word's three states into one (${Math.round((this.painting?.encoded ?? 0) * 100)}%).`
 					: 'The painter is still downloading.';
 			else if (inPainter && this.painting && tick >= this.painting.ticksTotal)
-				caption = `The finished picture, decoded from the painter's last latent: ${passes} ${passes === 1 ? 'pass' : 'passes'} of 3.7 billion ternary weights, starting from noise.`;
+				caption = `The finished picture, decoded from the painter's last latent: ${passes} ${passes === 1 ? 'pass' : 'passes'} of ${this.model.painterWeights} ternary weights, starting from noise.`;
 			else if (inPainter) {
 				// what the ride point has reached: a block (its reading, then its picture) or a stage of the decoder
 				const tf = Math.max(0, this.ride - NL - HANDOFF);
 				const p = Math.min(passes - 1, Math.floor(tf / TICKS_PER_STEP)),
 					r = tf - p * TICKS_PER_STEP;
-				const head = `The painter, pass ${p + 1} of ${passes}`;
+				const sketch = this.model.fast && p === 0;
+				const head = sketch
+					? `The painter, pass 1 of ${passes}: a sketch at a quarter of the size`
+					: `The painter, pass ${p + 1} of ${passes}`;
+				const patches = sketch ? '256' : '1,024';
+				const lens = !!this.painter?.hasLens;
 				caption =
 					r < 25.5
-						? `${head}, block ${Math.min(25, Math.max(1, Math.round(r)))} of 25. Inside each block the picture's 1,024 patches read your words; the lower row shows where, in the words' colours. Your words run beneath as a cable: a word the picture reads hard climbs out to the spot it is read most, and its name lights up. The arcs are the words reading each other. Then the block changes the picture (the upper row).`
+						? `${head}, block ${Math.min(25, Math.max(1, Math.round(r)))} of 25. Inside each block the picture's ${patches} patches read your words; the lower row shows where, in the words' colours. Your words run beneath as a cable: a word the picture reads hard climbs out to the spot it is read most, and its name lights up. The arcs are the words reading each other.${lens ? ' Then the block changes the picture (the upper row).' : ''}`
 						: r < 27.5
-							? `${head}, decoding. The small pictures were only the decoder's first stage (64 × 64); now the last block's guess of the finished picture goes through the rest of it, doubling each time: ${r < 26.5 ? '128 × 128' : '256 × 256'}. The decoder never reads your words: it only sharpens what the blocks painted, so the threads run on under it, untouched.`
-							: `${head}: its guess of the finished picture, decoded in full at 512 × 512. The next pass starts from where this one moved the noise, and reads your words again.`;
+							? `${head}, decoding. ${sketch ? "The sketch's guess of the finished picture is enlarged to 512 × 512 and" : lens ? "The small pictures were only the decoder's first stage (64 × 64); now the last block's guess of the finished picture" : "The pass's guess of the finished picture"} goes through the decoder, doubling each time: ${r < 26.5 ? '128 × 128' : '256 × 256'}. The decoder never reads your words: it only sharpens what the blocks painted, so the threads run on under it, untouched.`
+							: sketch
+								? `${head}: the sketch, enlarged to 512 × 512. Mixed with fresh noise, it is where the second pass starts: at full size, reading your words again.`
+								: p < passes - 1
+									? `${head}: its guess of the finished picture, decoded in full at 512 × 512. The next pass starts from where this one moved the noise, and reads your words again.`
+									: `${head}: the finished picture, decoded in full at 512 × 512.`;
 			} else if (prog < 1)
 				caption =
 					frac < ATTN_SHARE
 						? `Layer 1 of ${NL}. "${word}" first takes in light from the words before it: each coloured stroke is one attention head reading one word.`
 						: `Layer 1 of ${NL}. Then its 6,144 neurons each push it a little: ${Math.round(((frac - ATTN_SHARE) / (1 - ATTN_SHARE)) * 6144).toLocaleString()} of 6,144 added so far. Each push is one column of 2,048 weights, each −1, 0 or +1.`;
-			else if (this.painter && TAP_LAYERS.some((t) => prog >= t && prog < t + 1.5))
-				caption = `Layer ${l} of ${NL}. The beads on the brighter ring mark where the painter will take each word: as it stands after layers 7, 14 and 21.`;
+			else if (this.painter && this.model.taps.some((t) => prog >= t && prog < t + 1.5))
+				caption = `Layer ${l} of ${NL}. The beads on the brighter ring mark where the painter will take each word: as it stands after layers ${listed(this.model.taps)}.`;
 			else
 				caption = `Layer ${l} of ${NL}. Each thread is one of your words; each jagged step is the sum of everything that layer adds to it. The faint italic words are what the model would say each word has become.`;
 			this.onStatus({
@@ -1046,13 +1089,21 @@ export class Threads {
 							)
 						: [])
 				],
-				mode: this.mode
+				mode: this.mode,
+				done: !!this.painting?.done
 			});
 		}
 	}
 }
 
 // ---- helpers
+
+/** 7, 14 and 21 */
+function listed(xs: number[]) {
+	return xs.length < 2
+		? String(xs[0] ?? '')
+		: `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`;
+}
 
 function median(xs: number[]) {
 	const s = [...xs].sort((a, b) => a - b);

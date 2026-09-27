@@ -25,7 +25,6 @@ import { WordWeave, type Stitch } from './word-weave';
 type V3 = [number, number, number];
 export const GRID = 32;
 export const TICKS_PER_STEP = 29;
-const TAPS = [7, 14, 21];
 
 // the panel (y) and its columns (x)
 const BLOCK = 2.6; // side of a block's picture and reading
@@ -55,6 +54,7 @@ export interface PaintingLayout {
 	x0: number; // where the painter begins along the journey
 	readerEnd: number; // where the reader's last layer stands
 	layers: number; // the reader's layer count
+	taps: number[]; // the reader's layers the painter listens to
 }
 
 /** A picture of side `side` facing the side the camera rides on: centred on x, its bottom edge at y. */
@@ -96,7 +96,9 @@ export class Painting {
 		private layout: PaintingLayout,
 		private palette: Float32Array, // word colours (linear rgb) by word index
 		readonly wordCount: number,
-		steps: number
+		steps: number,
+		/** Fast: the one-file model's 2 passes, the first a sketch at 256 x 256 (16 x 16 patches). */
+		readonly fast = false
 	) {
 		this.steps = steps;
 		this.x0 = layout.x0;
@@ -170,7 +172,8 @@ export class Painting {
 		seed: number
 	) {
 		painter.setSteps(this.steps);
-		painter.setNoise(undefined, seed);
+		if (this.fast) painter.textLength = 256;
+		painter.setNoise(undefined, seed, this.fast);
 		this.buildBraid(taps);
 		this.mapPlanes = this.maps.map((t) => this.planes.add(t));
 		const { tasks } = painter.encodeTasks(llm, prompt, scheduler.slice);
@@ -244,7 +247,7 @@ export class Painting {
 			const end = t[2];
 			const M: V3 = [merge, end[1], end[2]];
 			t.forEach((p, j) => {
-				const w0 = readShare * (TAPS[j] / L.layers),
+				const w0 = readShare * (L.taps[j] / L.layers),
 					w1 = j === 2 ? readShare : readShare * 0.98;
 				// an arc out of the bundle and over the later layers (a straight run for the thread's own end)
 				const my = (p[1] + M[1]) / 2,
@@ -288,7 +291,9 @@ export class Painting {
 	 * One block's reading: its card in the readings row, where each word's thread comes down at the place it is read
 	 * most; and the words' reading of each other (words: [word][word]).
 	 */
-	private read(s: number, b: number, attn: Float32Array, words?: Float32Array) {
+	private read(s: number, b: number, a: Float32Array, words?: Float32Array) {
+		// a sketch pass reads 16 x 16 patches: each stands for 2 x 2 of the full grid (shown as the blocks they are)
+		const attn = a.length === GRID * GRID * this.wordCount ? a : enlarge(a, this.wordCount);
 		for (let i = 0; i < attn.length; i++) this.sum[i] += attn[i];
 		this.reads++;
 		const tick = s * TICKS_PER_STEP + b + 1;
@@ -486,6 +491,19 @@ export class Painting {
 		this.gallery.destroy();
 		for (const t of this.textures) t.destroy();
 	}
+}
+
+/** Attention over 16 x 16 patches [patch][word] as over 32 x 32 (each patch repeated over the 2 x 2 it covers). */
+function enlarge(a: Float32Array, n: number) {
+	const out = new Float32Array(GRID * GRID * n),
+		g = GRID / 2;
+	for (let y = 0; y < GRID; y++)
+		for (let x = 0; x < GRID; x++)
+			out.set(
+				a.subarray(((y >> 1) * g + (x >> 1)) * n, ((y >> 1) * g + (x >> 1) + 1) * n),
+				(y * GRID + x) * n
+			);
+	return out;
 }
 
 /**
