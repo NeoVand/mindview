@@ -157,15 +157,16 @@
 				s.attachReader(await turboReader(gpu!.device, onProgress));
 				live = true;
 				painterNote = 'The painter is downloading';
+				s.painterComing = true;
 				turboPainter(gpu!.device, onProgress)
 					.then((p) => {
 						painterNote = '';
 						study?.attachPainter(p);
 					})
-					.catch(
-						(e) =>
-							(painterNote = `The painter could not load: ${e instanceof Error ? e.message : e}`)
-					);
+					.catch((e) => {
+						painterNote = `The painter could not load: ${e instanceof Error ? e.message : e}`;
+						s.painterComing = false;
+					});
 			}
 			stage = 'journey';
 			playing = false;

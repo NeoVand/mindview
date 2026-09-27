@@ -72,6 +72,7 @@
 			ready = true;
 			// the painter (1.1 GB) downloads while the reader runs; the journey continues into it when it is ready
 			painterNote = 'The painter is downloading';
+			study.painterComing = true;
 			labPainter(gpu.device, (p) => {
 				painterNote =
 					p.fraction < 1 ? `The painter is downloading: ${Math.round(p.fraction * 100)}%` : '';
@@ -84,9 +85,10 @@
 					releasePainting();
 					if (alive) study?.attachPainter(p);
 				})
-				.catch(
-					(e) => (painterNote = `The painter could not load: ${e instanceof Error ? e.message : e}`)
-				);
+				.catch((e) => {
+					painterNote = `The painter could not load: ${e instanceof Error ? e.message : e}`;
+					if (study) study.painterComing = false;
+				});
 			await study.read(prompt);
 		})().catch((e) => (error = e instanceof Error ? e.message : String(e)));
 

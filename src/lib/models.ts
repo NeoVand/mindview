@@ -5,7 +5,7 @@
 //   the painter  Bonsai Image 4B's DiT, its decoder (TAEF2), the adapter from the reader, and the per-block lens, in the
 //                layout research/scripts/export_painter.py writes
 //   mindview-t2i-turbo  all of it for painting in one file (research/scripts/pack_model.py): the reader cut to 9
-//                layers, the map from it, the DiT, TAEF2, and the side branches for 1 and 2 steps
+//                layers, the map from it, the DiT, TAEF2, and the side branches for 1, 2 and 4 steps
 import { asset } from '$app/paths';
 
 declare const __LOCAL_MODELS__: boolean;
@@ -14,8 +14,9 @@ declare const __LOCAL_PACKED__: boolean;
 const READER_HUB =
 	'https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/983b5dec2ff16aab79990711ba0f828a499a7e6a/Ternary-Bonsai-1.7B-Q2_0.gguf';
 const PAINTER_HUB = 'https://huggingface.co/mohsenvand/mindview-painter/resolve/main';
-const PACKED_HUB =
-	'https://huggingface.co/mohsenvand/mindview-t2i-turbo/resolve/010bf1bdb18e1818998355bb8d358d96f1d93ab7/mindview-t2i-turbo.gguf';
+/** The revision of mindview-t2i-turbo the site reads (and the landing's recording was made with). */
+export const TURBO_REVISION = '84265a4de902418a3dd01ecd505e758997facbff';
+const PACKED_HUB = `https://huggingface.co/mohsenvand/mindview-t2i-turbo/resolve/${TURBO_REVISION}/mindview-t2i-turbo.gguf`;
 
 /** The reader's GGUF file. */
 export function readerUrl(): string {

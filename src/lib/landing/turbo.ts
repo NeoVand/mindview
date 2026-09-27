@@ -1,6 +1,6 @@
 // The landing's models: the one-file mindview-t2i-turbo, read once and kept while the site is open. The reader (its
 // first part, 158 MB) arrives first and can start reading while the painter (the rest) is still downloading.
-import { packedUrl } from '$lib/models';
+import { packedUrl, TURBO_REVISION } from '$lib/models';
 import { ensureFonts } from '$lib/engine/text';
 import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
 import { PackedModel } from '$lib/runtime/packed';
@@ -42,7 +42,7 @@ export const TURBO: ThreadsModel = {
 	painterWeights: '3.7 billion',
 	textRows: 256,
 	fast: true,
-	name: 'mohsenvand/mindview-t2i-turbo'
+	name: `mohsenvand/mindview-t2i-turbo@${TURBO_REVISION}`
 };
 
 /** The reader (Ternary Bonsai 1.7B, its first layers), on the device. */

@@ -191,6 +191,9 @@ export class Threads {
 		this.painter = painter;
 	}
 
+	/** A painter is downloading (attachPainter will follow): the ride waits for it after the reader. */
+	painterComing = false;
+
 	/** The reader is ready (a piece made to play a recording can then read live). */
 	attachReader(llm: BonsaiLLM) {
 		this.llm = llm;
@@ -907,8 +910,14 @@ export class Threads {
 		const NL = this.layers;
 		const total = this.journeyLength;
 		// the painter starts when the reader is done
-		if (this.ready && !this.reading && this.canPaint && prog >= NL && !this.painting)
+		if (this.ready && !this.reading && this.canPaint && prog >= NL && !this.painting) {
 			this.startPainting();
+			// the painter came after the reader had finished and the whole was on show: ride on into it
+			if (this.mode === 'overview') {
+				this.mode = 'live';
+				this.modeTime = 0;
+			}
+		}
 		this.painting?.update();
 		// fade out while a new prompt is being read, back in when its journey begins
 		this.post.fade += ((this.reading ? 0 : 1) - this.post.fade) * (1 - Math.exp(-dt * 5));
@@ -928,9 +937,10 @@ export class Threads {
 			this.modeTime += dt;
 			if (this.mode === 'live') {
 				this.ride = front;
+				// with a painter on its way, the ride waits at the handoff for it
 				const finished = this.canPaint
 					? !!this.painting?.done && front >= total - 0.01
-					: prog >= NL;
+					: prog >= NL && !this.painterComing;
 				if (finished) {
 					this.mode = this.painting?.done ? 'finale' : 'overview';
 					this.modeTime = 0;

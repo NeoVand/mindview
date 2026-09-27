@@ -167,7 +167,12 @@ export async function load(base: string): Promise<Recording> {
 		meta.paint.map(async (ev): Promise<PaintEvent> => {
 			if (ev.kind === 'block') return { ...ev, attn: take(ev.attn), words: take(ev.words) };
 			if (ev.kind === 'stage' || ev.kind === 'final')
-				return { ...ev, image: await get(ev.image).then((r) => r.blob()) };
+				return {
+					...ev,
+					image: new Blob([await get(ev.image).then((r) => r.arrayBuffer())], {
+						type: 'image/webp'
+					})
+				};
 			return ev;
 		})
 	);
