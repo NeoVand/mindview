@@ -247,9 +247,9 @@
 		<p>
 			One file of about a gigabyte paints this, on your GPU, in this tab. Ternary Bonsai 1.7B reads
 			your words with its first 9 layers; a linear map turns them into the painter's conditioning;
-			the ternary diffusion transformer of Bonsai Image 4B paints in four steps, or in two or one
-			with small side branches learned for few steps; TAEF2 turns the result into pixels. Nearly
-			every weight is −1, 0 or +1.
+			the ternary diffusion transformer of Bonsai Image 4B paints in one, two or four steps, each
+			with a small side branch trained for it; TAEF2 turns the result into pixels. Nearly every
+			weight is −1, 0 or +1.
 		</p>
 		<p class="links">
 			<a href={HF}>The model on Hugging Face</a>
