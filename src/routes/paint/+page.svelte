@@ -43,6 +43,8 @@
 			};
 			const llm = Reader.fromGGUF(dev, await packed.readerGGUF((f) => say(f * r)));
 			const painter = await ThePainter.fromPacked(dev, packed, (e) => say(r + e.fraction * p));
+			// the text stream cut to what the prompt needs (the rest is padding): the same pictures, a third less work
+			painter.textLength = 'auto';
 			return { llm, painter, megabytes: mb(total) };
 		})().catch((e) => {
 			model = undefined;
@@ -96,6 +98,7 @@
 		if (!ready || painting || !text) return;
 		painting = true;
 		result = '';
+		error = null;
 		try {
 			const { llm, painter } = await load();
 			const t0 = performance.now();
@@ -225,7 +228,10 @@
 
 <style>
 	main {
-		min-height: 100vh;
+		/* the site locks the page itself (app.css); this page scrolls inside main, which phones need */
+		position: fixed;
+		inset: 0;
+		overflow-y: auto;
 		box-sizing: border-box;
 		display: grid;
 		grid-template-columns: minmax(18rem, 30rem) 1fr;
@@ -236,7 +242,7 @@
 		color: var(--bone);
 	}
 	nav {
-		position: fixed;
+		position: absolute;
 		top: 1.1rem;
 		right: 1.4rem;
 		display: flex;

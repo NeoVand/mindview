@@ -222,6 +222,10 @@ def main():
     ap.add_argument('--out', default=os.path.join(ROOT, 'static/models/mindview-t2i/model.gguf'))
     ap.add_argument('--fused', help='a conditioning map from adapter_layers.py (fused_layers_*.pt)')
     ap.add_argument('--float', action='store_true', help='keep the fitted map f16 instead of ternary')
+    ap.add_argument('--lora', help='a few-step LoRA for the DiT (diffusers safetensors), stored as a side branch')
+    ap.add_argument('--lora-source', default='radames/FLUX.2-klein-Sana-Sprint', help='where the LoRA comes from')
+    ap.add_argument('--lora-rank', type=int, default=64, help="keep the LoRA's best rank-r approximation")
+    ap.add_argument('--schedules', default='1,2,3,4', help="other step counts to carry (from the bundle's schedules)")
     args = ap.parse_args()
     fused = None
     if args.fused:
@@ -356,6 +360,54 @@ def main():
     print(f"dit + decoder: {rep['params'] / 1e6:.1f} M ternary weights, trits {rep['trits'] / 1e6:.1f} MB, "
           f"scales {rep['scales'] / 1e6:.1f} MB, dense {rep['dense'] / 1e6:.1f} MB, zeros {rep['zeros'] / rep['params']:.3f}")
 
+    # ---- other step counts: sigmas and modulation per step (export_painter_schedules.py), and a few-step LoRA
+    sched_meta = {}
+    sj = os.path.join(PAINTER, 'schedules.json')
+    if args.schedules and os.path.exists(sj):
+        allm = json.load(open(sj))['512']
+        data = np.fromfile(os.path.join(PAINTER, 'schedules.bin'), dtype=np.float32)
+        parts_s, at = [], 0
+        for n in [int(x) for x in args.schedules.split(',')]:
+            m = allm[str(n)]
+            parts_s.append(data[m['offset']:m['offset'] + n * m['rows'] * 3072])
+            sched_meta[str(n)] = dict(sigmas=m['sigmas'], mu=m['mu'], rows=m['rows'], offset=at)
+            at += n * m['rows'] * 3072
+        w.add('sched.mod', (3072, at // 3072), F32, np.concatenate(parts_s).tobytes())
+    lora_meta = None
+    if args.lora:
+        import torch
+        from safetensors import safe_open
+        r = args.lora_rank
+        n_lora = 0
+        with safe_open(args.lora, 'pt') as f:
+            meta = f.metadata() or {}
+            scale = float(meta.get('alpha', 1)) / float(meta.get('rank', 1)) if 'alpha' in meta else 1.0
+            for m in sorted({k.rsplit('.lora_', 1)[0] for k in f.keys()}):
+                name = m.removeprefix('transformer.')
+                assert f'{name}.weight' in man['tensors'], f'no DiT weight for LoRA module {name}'
+                A = f.get_tensor(f'{m}.lora_A.weight').double()  # [R, in]
+                B = f.get_tensor(f'{m}.lora_B.weight').double() * scale  # [out, R]
+                # the best rank-r approximation of B A, split evenly (sqrt of the singular values on each side)
+                Qb, Rb = torch.linalg.qr(B)
+                Qa, Ra = torch.linalg.qr(A.T)
+                U, S, Vh = torch.linalg.svd(Rb @ Ra.T)
+                sq = S[:r].sqrt()
+                Ar = (sq[:, None] * (Vh[:r] @ Qa.T)).numpy()  # [r, in]
+                Bt = ((Qb @ U[:, :r]) * sq[None, :]).numpy().T  # [r, out]
+                for suffix, x in (('a', Ar), ('bt', Bt)):
+                    h = np.ascontiguousarray(x).astype(np.float16)
+                    assert np.isfinite(h).all()
+                    u = h.view(np.uint16)
+                    w.add(f'lora.{name}.{suffix}', (x.shape[1], x.shape[0]), F16_PLANES,
+                          (u >> 8).astype(np.uint8).tobytes() + (u & 0xFF).astype(np.uint8).tobytes())
+                n_lora += 1
+        lora_meta = dict(rank=r, modules=n_lora, steps=[1, 2], scale=1.0,
+                         source=args.lora_source,
+                         method=meta.get('method', ''), license='apache-2.0',
+                         note=f'the LoRA\'s best rank-{r} approximation (SVD of B A per module); '
+                              'y = W x + B (A x), on for 1 and 2 steps')
+        print(f'lora: {n_lora} modules at rank {r}')
+
     # ---- what the runtime needs to know
     painter = {k: man[k] for k in ('text', 'image', 'schedule', 'taef2', 'config') if k in man}
     painter['text'] = dict(painter['text'], taps=taps, llm_layers_run=layers)
@@ -365,6 +417,10 @@ def main():
         'prefix': 'cond.prefix: text rows 0..2, the same for every prompt',
     }
     w.string('mindview.painter', json.dumps(painter))
+    if sched_meta:
+        w.string('mindview.schedules', json.dumps({'512': sched_meta}))
+    if lora_meta:
+        w.string('mindview.lora', json.dumps(lora_meta))
     w.string('mindview.trits', TRIT_DOC)
     w.string('mindview.deflate', DEFLATE_DOC)
     w.string('mindview.stored', json.dumps({n: len(d) for n, _, ty, d in w.tensors if ty == DEFLATE}))
@@ -373,13 +429,15 @@ def main():
         'dit': man.get('source', {}).get('dit'),
         'cond': cond_source,
         'decoder': 'madebyollin/taef2',
+        **({'lora': f'{args.lora_source} (Apache 2.0), rank {args.lora_rank} of 256, for 1 and 2 steps'}
+           if args.lora else {}),
     }))
 
     total = w.write(args.out)
     parts = {}
     for n, _, ty, d in w.tensors:
         k = 'reader' if n.startswith(('token_embd', 'blk.', 'output_norm', 'tokenizer')) else 'cond' if n.startswith('cond.') \
-            else 'decoder' if n.startswith('taef2') else 'dit'
+            else 'decoder' if n.startswith('taef2') else 'lora' if n.startswith('lora.') else 'dit'
         parts[k] = parts.get(k, 0) + len(d)
     print('stored: ' + ', '.join(f'{k} {v / 1e6:.1f} MB' for k, v in parts.items()))
     print(f'wrote {args.out}: {total / 1e6:.1f} MB ({total / 2**30:.3f} GiB), {len(w.tensors)} tensors')
