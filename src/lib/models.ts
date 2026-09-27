@@ -4,8 +4,8 @@
 //   the reader   PrismML's Ternary Bonsai 1.7B, as they publish it (GGUF, 2-bit ternary)
 //   the painter  Bonsai Image 4B's DiT, its decoder (TAEF2), the adapter from the reader, and the per-block lens, in the
 //                layout research/scripts/export_painter.py writes
-//   mindview-t2i all of it for painting in one file (research/scripts/pack_model.py): the reader cut to 9 layers, the
-//                map from it, the DiT and TAEF2
+//   mindview-t2i-turbo  all of it for painting in one file (research/scripts/pack_model.py): the reader cut to 9
+//                layers, the map from it, the DiT, TAEF2, and the side branches for 1 and 2 steps
 import { asset } from '$app/paths';
 
 declare const __LOCAL_MODELS__: boolean;
@@ -15,7 +15,7 @@ const READER_HUB =
 	'https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/983b5dec2ff16aab79990711ba0f828a499a7e6a/Ternary-Bonsai-1.7B-Q2_0.gguf';
 const PAINTER_HUB = 'https://huggingface.co/mohsenvand/mindview-painter/resolve/main';
 const PACKED_HUB =
-	'https://huggingface.co/mohsenvand/mindview-t2i/resolve/fec978c425568e5d7112ec7978ea697029d1ae1d/mindview-t2i.gguf';
+	'https://huggingface.co/mohsenvand/mindview-t2i-turbo/resolve/f8be0ede949d85fa6c8a523ba3f5702b74e87c50/mindview-t2i-turbo.gguf';
 
 /** The reader's GGUF file. */
 export function readerUrl(): string {

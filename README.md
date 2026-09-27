@@ -29,9 +29,10 @@ picture the painter has in mind at that point.
 ## One file, under a gigabyte
 
 The labs run the whole pipeline above, because they show all of it. Painting alone needs less.
-[mindview-t2i](https://huggingface.co/mohsenvand/mindview-t2i) is the same kind of pipeline packed into one file of
-980 MB, and [`/paint`](https://neovand.github.io/mindview/paint) runs it: type a prompt, get a picture. On a MacBook Air
-(M4) in Chrome a picture takes about 10 s in two steps (Fast) and 16 s in four (Best).
+[mindview-t2i-turbo](https://huggingface.co/mohsenvand/mindview-t2i-turbo) is the same kind of pipeline packed into one
+file of 990 MB, and [`/paint`](https://neovand.github.io/mindview/paint) runs it: type a prompt, get a picture. On a
+MacBook Air (M4) in Chrome a picture takes about 5 s in one step (Instant), 7 s in two (Fast) and 16 s in four (Best).
+[mindview-t2i](https://huggingface.co/mohsenvand/mindview-t2i) is the earlier file, without the 1-step branch.
 
 - **The reader keeps 9 of its 28 layers.** A sweep over which reader layers to tap
   (`research/scripts/adapter_layers.py`) found that shallow layers condition the painter about as well as deep ones.
@@ -43,6 +44,13 @@ The labs run the whole pipeline above, because they show all of it. Painting alo
   [SANA-Sprint LoRA](https://huggingface.co/radames/FLUX.2-klein-Sana-Sprint), trained on the original klein, carries
   over to the ternary painter. Its best rank-8 approximation paints like the full rank 256 and costs 21 MB; it runs as a
   side branch of each ternary matrix (`research/scripts/lora_steps.py`, `lora_compress.py`).
+- **Two steps, the first at a quarter of the size.** Fast sketches its first step at 256 × 256 with the first 128 text
+  rows, upsamples that step's guess of the clean picture in latent space, noises it back and paints the second step at
+  512 × 512: a third less time, the same pictures (`research/scripts/progressive.py`, `progressive_rows.py`).
+- **One step from EPFL's RDM.** [epfl-vita/flux2-klein-1step-rdm](https://huggingface.co/epfl-vita/flux2-klein-1step-rdm)
+  distils klein to one step with a full fine-tune. Its change to the 100 big matrices carries over to the ternary
+  painter at rank 4 (10 MB), with the modulation recomputed from its time weights at σ = 1
+  (`research/scripts/rdm_delta.py`, `rdm_test.py`, `rdm_rank.py`).
 - **Ternary weights are stored 5 to a byte** (1.6 bits each). Tensors are deflated wherever that saves anything, and
   the browser inflates them. The file is read with range requests, in parts, so it is never all in memory at once.
 
@@ -53,7 +61,8 @@ The labs run the whole pipeline above, because they show all of it. Painting alo
 | The painter                        | 761.3 MB |
 | The decoder                        | 2.5 MB   |
 | The few-step LoRA (rank 8)         | 20.8 MB  |
-| Schedules for 1–4 steps            | 1.9 MB   |
+| The 1-step branch (rank 4)         | 9.8 MB   |
+| Schedules for 1–4 steps and RDM's  | 2.1 MB   |
 
 To rebuild it (after `research/scripts/adapter.py targets`, which runs the stock encoder over the prompts):
 
@@ -62,8 +71,12 @@ research/.venv/bin/python research/scripts/adapter_layers.py stats
 research/.venv/bin/python research/scripts/adapter_layers.py fit
 research/.venv/bin/python research/scripts/adapter_layers.py final 3 6 9
 research/.venv/bin/python research/scripts/pack_model.py --fused research/data/adapter/fused_final_layers_3_6_9.pt --float \
-  --lora <radames/FLUX.2-klein-Sana-Sprint's pytorch_lora_weights.safetensors> --lora-rank 8
+  --lora <radames/FLUX.2-klein-Sana-Sprint's pytorch_lora_weights.safetensors> --lora-rank 8 \
+  --rdm research/data/rdm/rdm_lora_r256.safetensors --rdm-rank 4
 ```
+
+The 1-step branch needs `research/scripts/rdm_delta.py` (RDM minus klein, as rank-256 SVDs) and
+`export_painter_schedules.py` (the `1r` schedule) first.
 
 What makes it fast in the browser: an f16 ternary GEMM (tiles staged and multiplied in f16, summed in f32), attention in
 f16, the text stream cut to what the prompt needs, and a register-tiled decoder. `/dev/gemm`, `/dev/profile` and
@@ -106,9 +119,9 @@ hf download prism-ml/Ternary-Bonsai-1.7B-gguf Ternary-Bonsai-1.7B-Q2_0.gguf --lo
 mkdir -p static/models/ternary-bonsai-1.7b
 mv /tmp/reader/Ternary-Bonsai-1.7B-Q2_0.gguf static/models/ternary-bonsai-1.7b/model.gguf
 hf download mohsenvand/mindview-painter --local-dir static/models/bonsai-image-4b
-hf download mohsenvand/mindview-t2i mindview-t2i.gguf --local-dir /tmp/t2i
+hf download mohsenvand/mindview-t2i-turbo mindview-t2i-turbo.gguf --local-dir /tmp/t2i
 mkdir -p static/models/mindview-t2i
-mv /tmp/t2i/mindview-t2i.gguf static/models/mindview-t2i/model.gguf
+mv /tmp/t2i/mindview-t2i-turbo.gguf static/models/mindview-t2i/model.gguf
 ```
 
 `MODELS=hub` or `MODELS=local` forces one or the other (see `vite.config.ts` and `src/lib/models.ts`).
@@ -151,5 +164,8 @@ Other commands:
 - [Ollin Boer Bohan](https://huggingface.co/madebyollin/taef2): TAEF2 (MIT).
 - The painter bundle on Hugging Face ([mohsenvand/mindview-painter](https://huggingface.co/mohsenvand/mindview-painter))
   repackages those weights for the browser, together with the adapter and the lens trained here.
-  [mohsenvand/mindview-t2i](https://huggingface.co/mohsenvand/mindview-t2i) packs them, with the map trained here,
-  into one file.
+  [mohsenvand/mindview-t2i-turbo](https://huggingface.co/mohsenvand/mindview-t2i-turbo) packs them, with the map
+  trained here, into one file.
+- [radames](https://huggingface.co/radames/FLUX.2-klein-Sana-Sprint): the 2-step LoRA (Apache 2.0).
+- [EPFL VITA](https://huggingface.co/epfl-vita/flux2-klein-1step-rdm): RDM, the 1-step fine-tune the 1-step branch comes
+  from (Apache 2.0).

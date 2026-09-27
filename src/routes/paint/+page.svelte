@@ -14,7 +14,7 @@
 	import { PackedModel } from '$lib/runtime/packed';
 	import { Painter as ThePainter } from '$lib/runtime/painter';
 
-	const HF = 'https://huggingface.co/mohsenvand/mindview-t2i';
+	const HF = 'https://huggingface.co/mohsenvand/mindview-t2i-turbo';
 	let prompt = $state('a lighthouse on a cliff during a thunderstorm, oil painting');
 	let seed = $state(7);
 	let status = $state('Starting the graphics card');
