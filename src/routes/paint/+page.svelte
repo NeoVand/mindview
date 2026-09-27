@@ -113,8 +113,8 @@
 				instantAvailable && mode === 'instant' ? '1r' : fastAvailable && mode === 'fast' ? 2 : 4;
 			painter.setSteps(schedule);
 			const steps = painter.steps;
-			// at 1 or 2 steps the pads matter more: keep 256 text rows (4 steps need only the prompt and a few)
-			painter.textLength = steps <= 2 ? 256 : 'auto';
+			// at 2 steps the pads matter more: keep 256 text rows (1 and 4 steps need only the prompt and a few)
+			painter.textLength = steps === 2 ? 256 : 'auto';
 			status = 'Reading your words';
 			await painter.encode(llm, text);
 			// 2 steps: the first sketches at 256 x 256 (a quarter of the work), the second paints at full size
