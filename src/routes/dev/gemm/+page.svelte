@@ -70,7 +70,8 @@
 					arena,
 					4,
 					kind === 'old' ? 0 : kind.endsWith('32') ? 32 : 16,
-					lBuf
+					lBuf,
+					kind.endsWith('64') ? 64 : 32
 				);
 				gemm.precision = kind.startsWith('f16') || kind === 'lora16' ? 'f16' : 'f32';
 				const job: GemmJob = {

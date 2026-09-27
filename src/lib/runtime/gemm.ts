@@ -119,7 +119,7 @@ const FAST_OUT = Array.from(
  * the f32 kernel on Apple GPUs, whose workgroup memory is the bottleneck. Needs shader-f16 (and BK 32 needs the 32 KB
  * workgroup storage limit in f32, 16 KB in f16).
  */
-export const gemmFastWGSL = (BK: 16 | 32, f16 = false) => {
+export const gemmFastWGSL = (BK: 16 | 32 | 64, f16 = false) => {
 	const T = f16 ? 'vec4<f16>' : 'vec4f';
 	const st = (v: string) => (f16 ? `vec4<f16>(${v})` : v);
 	const fma = f16 ? FAST16_FMA : FAST_FMA;
@@ -308,7 +308,8 @@ export class TernaryGemm {
 		arena: GPUBuffer,
 		private capacity = 1024,
 		fastBK: 0 | 16 | 32 = 16, // 0: the first kernel only
-		lora?: GPUBuffer // side branches' B matrices (see GemmJob.lora)
+		lora?: GPUBuffer, // side branches' B matrices (see GemmJob.lora)
+		f16BK: 32 | 64 = 32 // the f16 kernel's K-chunk (64 needs the 32 KB workgroup storage limit)
 	) {
 		this.layout = device.createBindGroupLayout({
 			entries: [
@@ -352,7 +353,7 @@ export class TernaryGemm {
 					compute: {
 						module: device.createShaderModule({
 							label: 'ternary gemm (fast, f16)',
-							code: gemmFastWGSL(32, true)
+							code: gemmFastWGSL(f16BK, true)
 						}),
 						entryPoint: 'gemm'
 					}

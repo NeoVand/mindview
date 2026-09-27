@@ -60,6 +60,7 @@
 		const llm = BonsaiLLM.fromGGUF(device, await packed.readerGGUF());
 		const painter = await Painter.fromPacked(device, packed);
 		const totals: Record<string, number[]> = {};
+		const phases: Record<string, number[][]> = {}; // [read the prompt, paint, decode] ms per picture
 		for (const p of PROMPTS)
 			for (const l of lengths) {
 				status = `${l}: ${p}`;
@@ -69,18 +70,25 @@
 				painter.setSteps(steps);
 				const t0 = performance.now();
 				await painter.encode(llm, p);
+				const t1 = performance.now();
 				painter.setNoise(undefined, seed);
 				for (let s = 0; s < steps; s++) await painter.step(s);
+				await device.queue.onSubmittedWorkDone();
+				const t2 = performance.now();
 				await painter.decode();
 				await device.queue.onSubmittedWorkDone();
 				const secs = (performance.now() - t0) / 1000;
+				(phases[String(l)] ??= []).push([t1 - t0, t2 - t1, performance.now() - t2]);
 				cells[`${l}|${p}`] = { url: await pixels(device, painter.taef2.texture), secs };
 				(totals[String(l)] ??= []).push(secs);
 			}
+		const mean = (v: number[]) => v.reduce((a, b) => a + b, 0) / v.length;
 		summary = Object.entries(totals)
-			.map(
-				([l, v]) => `${l}: ${(v.reduce((a, b) => a + b, 0) / v.length).toFixed(1)} s per picture`
-			)
+			.map(([l, v]) => {
+				const ph = phases[l];
+				const part = (k: number) => (mean(ph.map((x) => x[k])) / 1000).toFixed(1);
+				return `${l}: ${mean(v).toFixed(1)} s per picture (read ${part(0)} s, paint ${part(1)} s, decode ${part(2)} s; first ${v[0].toFixed(1)} s)`;
+			})
 			.join(' · ');
 		status = 'done';
 	}

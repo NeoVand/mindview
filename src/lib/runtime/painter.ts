@@ -12,6 +12,7 @@ import { fetchModelFile, fetchModelJson } from './cache';
 import { halfToFloat, unpackTrits, GGML_TRIT5, type GGUFTensor } from './gguf';
 import { PackedModel } from './packed';
 import { TernaryGemm, type GemmJob } from './gemm';
+import { DenseGemm, denseOk, type DenseJob } from './dense';
 import { PainterFiles } from './painter-files';
 import { gemmMs, type GpuTask } from './scheduler';
 import { Taef2 } from './taef2';
@@ -276,6 +277,7 @@ export interface PainterLora {
 type Op =
 	| { k: 'kernel'; name: Kernel; p: number[]; f?: number[]; wg: [number, number, number] }
 	| { k: 'gemm'; job: GemmJob }
+	| { k: 'dense'; job: DenseJob } // f16 dense GEMM (attention)
 	| { k: 'copy'; from: number; to: GPUBuffer; at: number; count: number }; // arena floats -> buffer floats
 
 /** Where the numbers of one row live in a stream at a tap point: the region, its row width, its first row. */
@@ -428,6 +430,7 @@ export class Painter {
 	private codesBuf: GPUBuffer;
 	private scalesBuf: GPUBuffer;
 	private gemm: TernaryGemm;
+	private dense16?: DenseGemm; // attention's matrix products in f16 (with precision 'f16')
 	private pipes: Record<Kernel, GPUComputePipeline>;
 	private bind: GPUBindGroup;
 	private params: GPUBuffer;
@@ -546,6 +549,9 @@ export class Painter {
 		}
 
 		this.gemm = new TernaryGemm(device, codes, scales, this.arena, 1024, 16, lora?.buf);
+		this.dense16 = device.features.has('shader-f16')
+			? new DenseGemm(device, this.arena, 256)
+			: undefined;
 		const module = device.createShaderModule({ label: 'painter', code: WGSL });
 		const layout = device.createBindGroupLayout({
 			entries: [
@@ -742,6 +748,12 @@ export class Painter {
 		const tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
 		const denseAt = new Map<string, number>();
 		const loraAt = new Map<string, number>(); // the LoRA's B (transposed), in a buffer of its own
+		// the GEMM's side branch runs in chunks of 32: a LoRA of lower rank is padded with zero rows (buffers start zeroed)
+		const loraMeta = model.meta['mindview.lora']
+			? (JSON.parse(String(model.meta['mindview.lora'])) as { rank: number })
+			: undefined;
+		const rank = loraMeta?.rank ?? 0,
+			padded = Math.ceil(rank / 32) * 32;
 		let nc = 0,
 			ns = 0,
 			nd = 0,
@@ -749,7 +761,10 @@ export class Painter {
 		for (const t of ts) {
 			if (t.name.startsWith('lora.') && t.name.endsWith('.bt')) {
 				loraAt.set(t.name, nl);
-				nl += Math.ceil(PackedModel.count(t) / 4) * 4;
+				nl += Math.ceil(((PackedModel.count(t) / rank) * padded) / 4) * 4;
+			} else if (t.name.startsWith('lora.') && t.name.endsWith('.a')) {
+				denseAt.set(t.name, nd);
+				nd += Math.ceil(((PackedModel.count(t) / rank) * padded) / 4) * 4;
 			} else if (isTernary(t)) {
 				const [K, M] = t.dims;
 				tern.set(t.name, { rows: M, cols: K, codes: nc, scales: ns });
@@ -802,9 +817,6 @@ export class Painter {
 			},
 			names: (prefix) => [...kept.keys()].filter((k) => k.startsWith(prefix))
 		};
-		const loraMeta = model.meta['mindview.lora']
-			? (JSON.parse(String(model.meta['mindview.lora'])) as { rank: number })
-			: undefined;
 		const painter = new Painter(
 			device,
 			source,
@@ -814,7 +826,7 @@ export class Painter {
 			tern,
 			denseAt,
 			new Map(),
-			loraBuf && loraMeta ? { buf: loraBuf, at: loraAt, rank: loraMeta.rank } : undefined
+			loraBuf && loraMeta ? { buf: loraBuf, at: loraAt, rank: padded } : undefined
 		);
 		// other step counts (sigmas and modulation per step), when the file carries them
 		const sched = model.meta['mindview.schedules'];
@@ -898,6 +910,12 @@ export class Painter {
 	/** One denoising step (0..3): the DiT's 25 blocks, then the Euler update. Calls onBlock after each block. */
 	async step(s: number, onBlock?: BlockHook) {
 		const { ops, hooks } = this.stepOps(s);
+		if (!onBlock) {
+			// nothing to look at in between: one submission, one wait
+			this.run(ops);
+			await this.device.queue.onSubmittedWorkDone();
+			return;
+		}
 		// submit block by block so the visuals can look in between
 		let from = 0;
 		for (const [to, b] of hooks) {
@@ -961,6 +979,46 @@ export class Painter {
 				[1e-6]
 			);
 		const attention = (v: number, vStride: number, out: number, outStride: number) => {
+			const qk: DenseJob = {
+				M: nj,
+				N: nj,
+				K: HD,
+				a: at.q,
+				lda: D,
+				sa: HD,
+				b: at.k,
+				ldb: D,
+				sb: HD,
+				c: at.s,
+				ldc: nj,
+				sc: nj * nj,
+				batch: H,
+				nn: false,
+				scale: 1 / Math.sqrt(HD)
+			};
+			const pv: DenseJob = {
+				M: nj,
+				N: HD,
+				K: nj,
+				a: at.s,
+				lda: nj,
+				sa: nj * nj,
+				b: v,
+				ldb: vStride,
+				sb: HD,
+				c: out,
+				ldc: outStride,
+				sc: HD,
+				batch: H,
+				nn: true,
+				scale: 1
+			};
+			if (this.dense16 && this.gemm.precision === 'f16' && denseOk(qk) && denseOk(pv)) {
+				ops.push({ k: 'dense', job: qk });
+				K('softmax', [H * nj, nj, at.s], [Math.min(H * nj, 65535), Math.ceil((H * nj) / 65535), 1]);
+				ops.push({ k: 'dense', job: pv });
+				return;
+			}
 			K(
 				'dgemm',
 				[nj, nj, HD, at.q, D, HD, at.k, D, HD, at.s, nj, nj * nj, 0],
@@ -1115,6 +1173,7 @@ export class Painter {
 	private cost(o: Op): number {
 		if (o.k === 'copy') return 0.002;
 		if (o.k === 'gemm') return gemmMs(o.job.M, o.job.N, o.job.K);
+		if (o.k === 'dense') return (2 * o.job.M * o.job.N * o.job.K * o.job.batch) / 1.6e9;
 		const p = o.p;
 		switch (o.name) {
 			case 'dgemm':
@@ -1136,7 +1195,7 @@ export class Painter {
 	private slice(o: Op, budget: number): Op[] {
 		const c = this.cost(o);
 		if (c <= budget || o.k === 'copy') return [o];
-		const rows = o.k === 'gemm' ? o.job.M : o.p[0];
+		const rows = o.k === 'gemm' || o.k === 'dense' ? o.job.M : o.p[0];
 		let R = Math.max(64, Math.floor((rows * budget) / c / 64) * 64);
 		if (o.k === 'kernel' && (o.name === 'softmax' || o.name === 'modulate' || o.name === 'swiglu'))
 			R = Math.max(1, Math.floor((rows * budget) / c));
@@ -1148,6 +1207,11 @@ export class Painter {
 			if (o.k === 'gemm') {
 				const j = o.job;
 				out.push({ k: 'gemm', job: { ...j, M: n, x: j.x + r0 * j.K, y: j.y + r0 * j.N } });
+				continue;
+			}
+			if (o.k === 'dense') {
+				const j = o.job;
+				out.push({ k: 'dense', job: { ...j, M: n, a: j.a + r0 * j.lda, c: j.c + r0 * j.ldc } });
 				continue;
 			}
 			const p = [...o.p];
@@ -1737,6 +1801,7 @@ export class Painter {
 	private slotSub = -1;
 	private slotAt = 0;
 	private gemmAt = 0;
+	private denseAt16 = 0;
 
 	/**
 	 * GPU time of every op of one step (each op in a pass of its own, with timestamps), labelled by what it is. For
@@ -1770,11 +1835,13 @@ export class Painter {
 			label:
 				o.k === 'gemm'
 					? `gemm ${o.job.M}x${o.job.N}x${o.job.K}`
-					: o.k === 'kernel' && o.name === 'dgemm'
-						? `dgemm ${o.p[0]}x${o.p[1]}x${o.p[2]}${o.wg[2] > 1 ? ` x${o.wg[2]}` : ''}`
-						: o.k === 'kernel'
-							? o.name
-							: 'copy',
+					: o.k === 'dense'
+						? `dense ${o.job.M}x${o.job.N}x${o.job.K} x${o.job.batch}`
+						: o.k === 'kernel' && o.name === 'dgemm'
+							? `dgemm ${o.p[0]}x${o.p[1]}x${o.p[2]}${o.wg[2] > 1 ? ` x${o.wg[2]}` : ''}`
+							: o.k === 'kernel'
+								? o.name
+								: 'copy',
 			ms: Number(t[2 * i + 1] - t[2 * i]) / 1e6
 		}));
 	}
@@ -1789,6 +1856,7 @@ export class Painter {
 			this.slotSub = sub ?? -1;
 			this.slotAt = 0;
 			this.gemmAt = 0;
+			this.denseAt16 = 0;
 		}
 		const k0 = this.slotAt,
 			g0 = this.gemmAt;
@@ -1799,15 +1867,20 @@ export class Painter {
 			new Float32Array(data, i * 256 + 64, 4).set(o.f ?? []);
 		});
 		const jobs = ops.flatMap((o) => (o.k === 'gemm' ? [o.job] : []));
+		const djobs = ops.flatMap((o) => (o.k === 'dense' ? [o.job] : []));
 		if (k0 + kernels.length > 1024 || g0 + jobs.length > 1024)
 			throw new Error('Too much painter work in one submission.');
 		if (kernels.length) dev.queue.writeBuffer(this.params, k0 * 256, data);
 		if (jobs.length) this.gemm.prepare(jobs, g0);
+		const d0 = this.denseAt16;
+		if (djobs.length) this.dense16!.prepare(djobs, d0);
 		this.slotAt += kernels.length;
 		this.gemmAt += jobs.length;
+		this.denseAt16 += djobs.length;
 		let pass: GPUComputePassEncoder | null = null;
 		let ki = k0,
 			gi = g0,
+			di = d0,
 			qi = 0;
 		for (const o of ops) {
 			if (o.k === 'copy') {
@@ -1831,7 +1904,8 @@ export class Painter {
 				pass.setPipeline(this.pipes[o.name]);
 				pass.setBindGroup(0, this.bind, [ki++ * 256]);
 				pass.dispatchWorkgroups(...o.wg);
-			} else this.gemm.dispatch(pass, gi++, o.job);
+			} else if (o.k === 'dense') this.dense16!.dispatch(pass, di++, o.job);
+			else this.gemm.dispatch(pass, gi++, o.job);
 		}
 		pass?.end();
 	}
