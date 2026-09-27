@@ -266,13 +266,32 @@ type Kernel =
 	| 'row_project'
 	| 'attn_pool'
 	| 'copy_rows';
-/** A LoRA as side branches (y = W x + B (A x)): A [rank][in] in the dense buffer (`lora.<module>.a`), B transposed
- * [rank][out] in a buffer of its own at the offsets in `at` (`lora.<module>.bt`). */
+/** The rope table's rows for a 16 x 16 patch grid (a first step at 256 x 256): rows 512 + 32 h + w of the full one. */
+function rope16(full: Float32Array): Float32Array {
+	const out = new Float32Array(256 * 64);
+	for (let h = 0; h < 16; h++)
+		for (let w = 0; w < 16; w++)
+			out.set(
+				full.subarray((ROPE_IMG + 32 * h + w) * 64, (ROPE_IMG + 32 * h + w + 1) * 64),
+				(16 * h + w) * 64
+			);
+	return out;
+}
+
+/**
+ * Side branches of the DiT's ternary matrices (y = W x + B (A x)), one set per prefix: `lora` (the few-step LoRA, for 1
+ * and 2 steps) and `rdm` (EPFL's 1-step fine-tune, with schedule '1r'). A [rank][in] is in the dense buffer
+ * (`<prefix>.<module>.a`), B transposed [rank][out] in a buffer of its own at the offsets in `at` (`<prefix>.<module>.bt`).
+ * Ranks are padded to multiples of 32.
+ */
 export interface PainterLora {
 	buf: GPUBuffer;
 	at: Map<string, number>;
-	rank: number;
+	ranks: Partial<Record<Branch, number>>;
 }
+type Branch = 'lora' | 'rdm';
+/** A schedule: a step count, or '1r' (1 step with the `rdm` branch). */
+export type Schedule = number | '1r';
 
 type Op =
 	| { k: 'kernel'; name: Kernel; p: number[]; f?: number[]; wg: [number, number, number] }
@@ -419,8 +438,12 @@ export class Painter {
 	/** Text rows of the current prompt's stream (joint rows: text 0 .. nt - 1, then the 1024 image rows). */
 	private nt = NT;
 	private get nj() {
-		return this.nt + NI;
+		return this.nt + this.ni;
 	}
+	/** Image rows of the current step: 1024 (32 x 32 patches, 512 x 512) or 256 (16 x 16, a first step at 256 x 256). */
+	private ni = NI;
+	/** Text rows for a first step at 256 x 256 (setNoise with low): a multiple of 64. */
+	lowTextRows = 128;
 	private pickRows(tokens: number) {
 		const want = this.textLength === 'auto' ? Math.ceil((tokens + 8) / 64) * 64 : this.textLength;
 		return Math.min(NT, Math.max(64, Math.ceil(want / 64) * 64));
@@ -448,10 +471,14 @@ export class Painter {
 	set precision(p: 'f32' | 'f16') {
 		this.gemm.precision = p;
 	}
-	/** On with 1 or 2 steps when the model has the few-step LoRA (setSteps); off otherwise. */
-	useLora = false;
+	/** The side branch in use (setSteps): the few-step LoRA with 1 or 2 steps, RDM with '1r'; none otherwise. */
+	private branch?: Branch;
 	get hasLora() {
-		return !!this.lora;
+		return !!this.lora?.ranks.lora;
+	}
+	/** Whether the file carries the 1-step fine-tune (schedule '1r'). */
+	get hasOneStep() {
+		return !!this.lora?.ranks.rdm && !!this.schedules?.meta['1r'];
 	}
 	private schedules?: {
 		meta: Record<string, { sigmas: number[]; offset: number }>;
@@ -500,7 +527,7 @@ export class Painter {
 			['cat', NJ * (D + MLP)],
 			['s', H * NJ * NJ],
 			['mod', 12 * 17 * D],
-			['lt', NJ * (lora?.rank ?? 0)], // a side branch's A x (see stepOps)
+			['lt', NJ * Math.max(0, ...Object.values(lora?.ranks ?? {}))], // a side branch's A x (see stepOps)
 			['abias', CTX],
 			['vl', NI * CIN],
 			['x0', 32 * 64 * 64],
@@ -640,6 +667,10 @@ export class Painter {
 			denseAt.set(k, nd);
 			nd += (tensors[k] as { shape: number[] }).shape.reduce((a, b) => a * b, 1);
 		}
+		for (const k of ['rope.cos16', 'rope.sin16']) {
+			denseAt.set(k, nd);
+			nd += 256 * 64;
+		}
 		// optional readouts for the visuals: the tuned lens and the latent colour probe (viz.json / viz.bin)
 		const viz = await fetchModelJson<
 			Record<
@@ -705,8 +736,11 @@ export class Painter {
 						where = tern.get(k)!;
 					device.queue.writeBuffer(codes, where.codes * 4, t.codes);
 					device.queue.writeBuffer(scales, where.scales * 4, t.scales);
-				} else if (denseAt.has(k))
+				} else if (denseAt.has(k)) {
 					device.queue.writeBuffer(dense, denseAt.get(k)! * 4, files.dense(k));
+					if (k === 'rope.cos' || k === 'rope.sin')
+						device.queue.writeBuffer(dense, denseAt.get(`${k}16`)! * 4, rope16(files.dense(k)));
+				}
 			}
 			if (n.startsWith('dit_') && n !== 'dit_misc.bin') files.release(n);
 		}
@@ -747,24 +781,32 @@ export class Painter {
 			k === 'cond.prefix';
 		const tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
 		const denseAt = new Map<string, number>();
-		const loraAt = new Map<string, number>(); // the LoRA's B (transposed), in a buffer of its own
-		// the GEMM's side branch runs in chunks of 32: a LoRA of lower rank is padded with zero rows (buffers start zeroed)
-		const loraMeta = model.meta['mindview.lora']
-			? (JSON.parse(String(model.meta['mindview.lora'])) as { rank: number })
-			: undefined;
-		const rank = loraMeta?.rank ?? 0,
-			padded = Math.ceil(rank / 32) * 32;
+		const loraAt = new Map<string, number>(); // the side branches' B (transposed), in a buffer of their own
+		// the GEMM's side branch runs in chunks of 32: a lower rank is padded with zero rows (buffers start zeroed)
+		const ranks: Partial<Record<Branch, number>> = {},
+			stored: Partial<Record<Branch, number>> = {};
+		for (const b of ['lora', 'rdm'] as const) {
+			const meta = model.meta[`mindview.${b}`];
+			if (!meta) continue;
+			stored[b] = (JSON.parse(String(meta)) as { rank: number }).rank;
+			ranks[b] = Math.ceil(stored[b]! / 32) * 32;
+		}
+		const branchOf = (name: string) => {
+			const b = name.slice(0, name.indexOf('.')) as Branch;
+			return stored[b] ? b : undefined;
+		};
 		let nc = 0,
 			ns = 0,
 			nd = 0,
 			nl = 0;
 		for (const t of ts) {
-			if (t.name.startsWith('lora.') && t.name.endsWith('.bt')) {
+			const b = branchOf(t.name);
+			if (b && t.name.endsWith('.bt')) {
 				loraAt.set(t.name, nl);
-				nl += Math.ceil(((PackedModel.count(t) / rank) * padded) / 4) * 4;
-			} else if (t.name.startsWith('lora.') && t.name.endsWith('.a')) {
+				nl += Math.ceil(((PackedModel.count(t) / stored[b]!) * ranks[b]!) / 4) * 4;
+			} else if (b && t.name.endsWith('.a')) {
 				denseAt.set(t.name, nd);
-				nd += Math.ceil(((PackedModel.count(t) / rank) * padded) / 4) * 4;
+				nd += Math.ceil(((PackedModel.count(t) / stored[b]!) * ranks[b]!) / 4) * 4;
 			} else if (isTernary(t)) {
 				const [K, M] = t.dims;
 				tern.set(t.name, { rows: M, cols: K, codes: nc, scales: ns });
@@ -774,6 +816,10 @@ export class Painter {
 				denseAt.set(t.name, nd);
 				nd += PackedModel.count(t);
 			}
+		}
+		for (const k of ['rope.cos16', 'rope.sin16']) {
+			denseAt.set(k, nd);
+			nd += 256 * 64;
 		}
 		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
 		const codes = device.createBuffer({ label: 'painter codes', size: nc * 4, usage });
@@ -802,6 +848,8 @@ export class Painter {
 						const v = PackedModel.floats(p, name);
 						if (onCpu(name)) kept.set(name, v);
 						else device.queue.writeBuffer(dense, denseAt.get(name)! * 4, v);
+						if (name === 'rope.cos' || name === 'rope.sin')
+							device.queue.writeBuffer(dense, denseAt.get(`${name}16`)! * 4, rope16(v));
 					}
 				}
 			},
@@ -826,7 +874,7 @@ export class Painter {
 			tern,
 			denseAt,
 			new Map(),
-			loraBuf && loraMeta ? { buf: loraBuf, at: loraAt, rank: padded } : undefined
+			loraBuf ? { buf: loraBuf, at: loraAt, ranks } : undefined
 		);
 		// other step counts (sigmas and modulation per step), when the file carries them
 		const sched = model.meta['mindview.schedules'];
@@ -889,11 +937,15 @@ export class Painter {
 		return { ids, real: n };
 	}
 
-	/** Start from the given noise (1024 x 128, bn-normalised latent space) or from seeded Gaussian noise. */
-	setNoise(noise?: Float32Array, seed = 7) {
+	/**
+	 * Start from the given noise (image rows x 128, bn-normalised latent space) or from seeded Gaussian noise; with
+	 * low, the first step runs at 256 x 256 (see upsampleLatent).
+	 */
+	setNoise(noise?: Float32Array, seed = 7, low = false) {
+		this.ni = low ? 256 : NI;
 		let z = noise;
 		if (!z) {
-			z = new Float32Array(NI * CIN);
+			z = new Float32Array(this.ni * CIN);
 			let s = seed >>> 0 || 1;
 			const rnd = () => ((s = (s * 1664525 + 1013904223) >>> 0) + 0.5) / 4294967296;
 			for (let i = 0; i < z.length; i += 2) {
@@ -905,6 +957,63 @@ export class Painter {
 		}
 		this.device.queue.writeBuffer(this.arena, this.at.lat * 4, z);
 		this.device.queue.writeBuffer(this.arena, this.at.noise * 4, z);
+	}
+
+	/**
+	 * After a first step at 256 x 256: the clean picture it predicts (x0 = latent - sigma1 v), upsampled to 512 x 512 in
+	 * latent space (bilinear, per channel) and noised back to sigma1 with fresh noise, for the next steps at full size.
+	 * Returns the upsampled prediction (for decode).
+	 */
+	async upsampleLatent(seed = 7): Promise<Float32Array> {
+		const s1 = this.sigmas[1],
+			n = 256;
+		const lat = await this.read(this.at.lat, n * CIN),
+			vel = await this.read(this.at.vel, n * CIN);
+		// token (h, w), channel 4c + 2dy + dx <-> latent pixel (2h + dy, 2w + dx) of channel c (32 channels)
+		const small = new Float32Array(32 * 32 * 32); // [c][y][x], 32 x 32 latent pixels
+		for (let t = 0; t < n; t++)
+			for (let k = 0; k < CIN; k++) {
+				const c = k >> 2,
+					dy = (k >> 1) & 1,
+					dx = k & 1;
+				small[(c * 32 + 2 * (t >> 4) + dy) * 32 + 2 * (t & 15) + dx] =
+					lat[t * CIN + k] - s1 * vel[t * CIN + k];
+			}
+		const at = (c: number, y: number, x: number) =>
+			small[(c * 32 + Math.min(31, Math.max(0, y))) * 32 + Math.min(31, Math.max(0, x))];
+		const z = new Float32Array(NI * CIN),
+			clean = new Float32Array(NI * CIN);
+		let r = seed >>> 0 || 1;
+		const rnd = () => ((r = (r * 1664525 + 1013904223) >>> 0) + 0.5) / 4294967296;
+		const noise = new Float32Array(NI * CIN);
+		for (let i = 0; i < noise.length; i += 2) {
+			const m = Math.sqrt(-2 * Math.log(rnd())),
+				th = 2 * Math.PI * rnd();
+			noise[i] = m * Math.cos(th);
+			noise[i + 1] = m * Math.sin(th);
+		}
+		for (let t = 0; t < NI; t++)
+			for (let k = 0; k < CIN; k++) {
+				const c = k >> 2,
+					y = 2 * (t >> 5) + ((k >> 1) & 1),
+					x = 2 * (t & 31) + (k & 1);
+				// bilinear, as torch's interpolate(scale 2, align_corners=False): source (y + 0.5) / 2 - 0.5
+				const sy = (y + 0.5) / 2 - 0.5,
+					sx = (x + 0.5) / 2 - 0.5;
+				const y0 = Math.floor(sy),
+					x0 = Math.floor(sx),
+					fy = sy - y0,
+					fx = sx - x0;
+				const v =
+					(1 - fy) * ((1 - fx) * at(c, y0, x0) + fx * at(c, y0, x0 + 1)) +
+					fy * ((1 - fx) * at(c, y0 + 1, x0) + fx * at(c, y0 + 1, x0 + 1));
+				clean[t * CIN + k] = v;
+				z[t * CIN + k] = (1 - s1) * v + s1 * noise[t * CIN + k];
+			}
+		this.ni = NI;
+		this.device.queue.writeBuffer(this.arena, this.at.lat * 4, z);
+		this.device.queue.writeBuffer(this.arena, this.at.noise * 4, noise);
+		return clean;
 	}
 
 	/** One denoising step (0..3): the DiT's 25 blocks, then the Euler update. Calls onBlock after each block. */
@@ -930,8 +1039,13 @@ export class Painter {
 	private stepOps(s: number, tap?: Tap, pool?: (b: number, ops: Op[]) => void) {
 		const at = this.at,
 			mod = at.mod + s * 17 * D,
-			nt = this.nt,
-			nj = this.nj;
+			ni = this.ni,
+			// a first step at 256 x 256 reads a prefix of the text rows (the reader is causal: the same rows)
+			nt = ni === NI ? this.nt : Math.min(this.nt, this.lowTextRows),
+			nj = nt + ni;
+		// image rows turn by the rope table's rows for (h, w): the full table's 512.. at 32 x 32, a 16 x 16 copy at 256
+		const ropeImg: [string, string, number] =
+			ni === NI ? ['rope.cos', 'rope.sin', ROPE_IMG] : ['rope.cos16', 'rope.sin16', 0];
 		const MI = (r: number) => mod + r * D,
 			MT = (r: number) => mod + (6 + r) * D,
 			MS = (r: number) => mod + (12 + r) * D,
@@ -945,13 +1059,14 @@ export class Painter {
 			const t = this.t(w);
 			// the few-step LoRA: T = X A^T first, then the ternary GEMM adds T B^T before its bias and gate
 			const mod = w.replace(/\.weight$/, '');
-			const lb = this.useLora ? this.lora?.at.get(`lora.${mod}.bt`) : undefined;
+			const br = this.branch;
+			const lb = br ? this.lora?.at.get(`${br}.${mod}.bt`) : undefined;
 			let lora: GemmJob['lora'];
-			if (lb !== undefined) {
-				const r = this.lora!.rank;
+			if (br && lb !== undefined) {
+				const r = this.lora!.ranks[br]!;
 				K(
 					'dgemm',
-					[M, r, t.cols, x, t.cols, 0, this.w(`lora.${mod}.a`), t.cols, 0, at.lt, r, 0, 1],
+					[M, r, t.cols, x, t.cols, 0, this.w(`${br}.${mod}.a`), t.cols, 0, at.lt, r, 0, 1],
 					[Math.ceil(r / 64), Math.ceil(M / 64), 1],
 					[1]
 				);
@@ -970,11 +1085,12 @@ export class Painter {
 			stride: number,
 			dst: number,
 			gain: string,
-			first: number
+			first: number,
+			table: [string, string] = ['rope.cos', 'rope.sin']
 		) =>
 			K(
 				'qknorm_rope',
-				[tokens, src, stride, dst, D, this.w(gain), this.w('rope.cos'), this.w('rope.sin'), first],
+				[tokens, src, stride, dst, D, this.w(gain), this.w(table[0]), this.w(table[1]), first],
 				[tokens, H, 1],
 				[1e-6]
 			);
@@ -1048,8 +1164,8 @@ export class Painter {
 		{
 			K(
 				'dgemm',
-				[NI, D, CIN, at.lat, CIN, 0, this.w('x_embedder.weight'), CIN, 0, at.h + I0, D, 0, 1],
-				[D / 64, NI / 64, 1],
+				[ni, D, CIN, at.lat, CIN, 0, this.w('x_embedder.weight'), CIN, 0, at.h + I0, D, 0, 1],
+				[D / 64, ni / 64, 1],
 				[1]
 			);
 			if (this.fused)
@@ -1081,38 +1197,44 @@ export class Painter {
 			const P = `transformer_blocks.${b}.`;
 			T('h_in', at.h, D, 0, 'all', b);
 			modulate(nt, at.h + T0, at.n1 + T0, MT(0), MT(1));
-			modulate(NI, at.h + I0, at.n1 + I0, MI(0), MI(1));
+			modulate(ni, at.h + I0, at.n1 + I0, MI(0), MI(1));
 			T('n1', at.n1, D, 0, 'all', b);
 			G(P + 'attn.add_q_proj.weight', nt, at.n1 + T0, at.q + T0);
 			G(P + 'attn.add_k_proj.weight', nt, at.n1 + T0, at.k + T0);
 			G(P + 'attn.add_v_proj.weight', nt, at.n1 + T0, at.v + T0);
-			G(P + 'attn.to_q.weight', NI, at.n1 + I0, at.q + I0);
-			G(P + 'attn.to_k.weight', NI, at.n1 + I0, at.k + I0);
-			G(P + 'attn.to_v.weight', NI, at.n1 + I0, at.v + I0);
+			G(P + 'attn.to_q.weight', ni, at.n1 + I0, at.q + I0);
+			G(P + 'attn.to_k.weight', ni, at.n1 + I0, at.k + I0);
+			G(P + 'attn.to_v.weight', ni, at.n1 + I0, at.v + I0);
 			T('q', at.q, D, 0, 'all', b);
 			T('k', at.k, D, 0, 'all', b);
 			T('v', at.v, D, 0, 'all', b);
 			qk(nt, at.q + T0, D, at.q + T0, P + 'attn.norm_added_q.weight', 0);
-			qk(NI, at.q + I0, D, at.q + I0, P + 'attn.norm_q.weight', ROPE_IMG);
+			qk(ni, at.q + I0, D, at.q + I0, P + 'attn.norm_q.weight', ropeImg[2], [
+				ropeImg[0],
+				ropeImg[1]
+			]);
 			qk(nt, at.k + T0, D, at.k + T0, P + 'attn.norm_added_k.weight', 0);
-			qk(NI, at.k + I0, D, at.k + I0, P + 'attn.norm_k.weight', ROPE_IMG);
+			qk(ni, at.k + I0, D, at.k + I0, P + 'attn.norm_k.weight', ropeImg[2], [
+				ropeImg[0],
+				ropeImg[1]
+			]);
 			T('qr', at.q, D, 0, 'all', b);
 			T('kr', at.k, D, 0, 'all', b);
 			attention(at.v, D, at.o, D);
 			T('attn', at.s, nj, 0, 'all', b);
 			pool?.(b, ops);
 			T('o', at.o, D, 0, 'all', b);
-			G(P + 'attn.to_out.0.weight', NI, at.o + I0, at.h + I0, { bias: MI(2), gated: true });
+			G(P + 'attn.to_out.0.weight', ni, at.o + I0, at.h + I0, { bias: MI(2), gated: true });
 			G(P + 'attn.to_add_out.weight', nt, at.o + T0, at.h + T0, { bias: MT(2), gated: true });
 			T('h_mid', at.h, D, 0, 'all', b);
-			modulate(NI, at.h + I0, at.n1 + I0, MI(3), MI(4));
+			modulate(ni, at.h + I0, at.n1 + I0, MI(3), MI(4));
 			modulate(nt, at.h + T0, at.n1 + T0, MT(3), MT(4));
 			T('n2', at.n1, D, 0, 'all', b);
-			G(P + 'ff.linear_in.weight', NI, at.n1 + I0, at.p);
+			G(P + 'ff.linear_in.weight', ni, at.n1 + I0, at.p);
 			T('p', at.p, 2 * MLP, nt, 'img', b);
-			K('swiglu', [NI, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, NI, 1]);
+			K('swiglu', [ni, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, ni, 1]);
 			T('cat', at.cat, MLP, nt, 'img', b);
-			G(P + 'ff.linear_out.weight', NI, at.cat, at.h + I0, { bias: MI(5), gated: true });
+			G(P + 'ff.linear_out.weight', ni, at.cat, at.h + I0, { bias: MI(5), gated: true });
 			G(P + 'ff_context.linear_in.weight', nt, at.n1 + T0, at.p);
 			T('p', at.p, 2 * MLP, 0, 'txt', b);
 			K('swiglu', [nt, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, nt, 1]);
@@ -1133,9 +1255,15 @@ export class Painter {
 			T('p', at.p, PW, 0, 'all', bb);
 			// text rows turn by rope rows 0.., image rows by rope rows 512.. (whatever the text length)
 			qk(nt, at.p, PW, at.q, P + 'attn.norm_q.weight', 0);
-			qk(NI, at.p + nt * PW, PW, at.q + nt * D, P + 'attn.norm_q.weight', ROPE_IMG);
+			qk(ni, at.p + nt * PW, PW, at.q + nt * D, P + 'attn.norm_q.weight', ropeImg[2], [
+				ropeImg[0],
+				ropeImg[1]
+			]);
 			qk(nt, at.p + D, PW, at.k, P + 'attn.norm_k.weight', 0);
-			qk(NI, at.p + D + nt * PW, PW, at.k + nt * D, P + 'attn.norm_k.weight', ROPE_IMG);
+			qk(ni, at.p + D + nt * PW, PW, at.k + nt * D, P + 'attn.norm_k.weight', ropeImg[2], [
+				ropeImg[0],
+				ropeImg[1]
+			]);
 			T('qr', at.q, D, 0, 'all', bb);
 			T('kr', at.k, D, 0, 'all', bb);
 			attention(at.p + 2 * D, PW, at.cat, CW);
@@ -1148,19 +1276,19 @@ export class Painter {
 			hooks.push([ops.length, bb]);
 		}
 		// velocity and the Euler update
-		modulate(NI, at.h + I0, at.n1 + I0, MO(1), MO(0));
+		modulate(ni, at.h + I0, at.n1 + I0, MO(1), MO(0));
 		T('nout', at.n1, D, 0, 'img', 25);
 		K(
 			'dgemm',
-			[NI, CIN, D, at.n1 + I0, D, 0, this.w('proj_out.weight'), D, 0, at.vel, CIN, 0, 1],
-			[CIN / 64, NI / 64, 1],
+			[ni, CIN, D, at.n1 + I0, D, 0, this.w('proj_out.weight'), D, 0, at.vel, CIN, 0, 1],
+			[CIN / 64, ni / 64, 1],
 			[1]
 		);
 		T('vel', at.vel, CIN, nt, 'img', 25);
 		K(
 			'euler',
-			[NI * CIN, at.lat, at.vel],
-			[Math.ceil((NI * CIN) / 256), 1, 1],
+			[ni * CIN, at.lat, at.vel],
+			[Math.ceil((ni * CIN) / 256), 1, 1],
 			[this.sigmas[s + 1] - this.sigmas[s]]
 		);
 
@@ -1915,24 +2043,30 @@ export class Painter {
 		return this.schedules
 			? Object.keys(this.schedules.meta)
 					.map(Number)
+					.filter((n) => n > 0)
 					.sort((a, b) => a - b)
 			: [4];
 	}
 
-	/** Use a schedule of n steps (sigmas and the per-step modulation). */
-	setSteps(n: number) {
+	/**
+	 * Use a schedule (sigmas and the per-step modulation): n steps, with the few-step LoRA at 1 or 2 when the file has
+	 * it, or '1r': 1 step with EPFL's 1-step fine-tune.
+	 */
+	setSteps(n: Schedule) {
 		const sc = this.schedules?.meta[String(n)];
-		this.useLora = !!this.lora && n <= 2;
+		if (n === '1r' && !this.hasOneStep) throw new Error('The painter has no 1-step fine-tune.');
+		this.branch = n === '1r' ? 'rdm' : this.hasLora && n <= 2 ? 'lora' : undefined;
 		if (!sc || !this.schedules) {
 			if (n !== 4) throw new Error(`The painter has no ${n}-step schedule.`);
 			return;
 		}
-		this.steps = n;
+		const steps = sc.sigmas.length - 1;
+		this.steps = steps;
 		this.sigmas = sc.sigmas;
 		this.device.queue.writeBuffer(
 			this.arena,
 			this.at.mod * 4,
-			this.schedules.data.subarray(sc.offset, sc.offset + n * 17 * D)
+			this.schedules.data.subarray(sc.offset, sc.offset + steps * 17 * D)
 		);
 	}
 
@@ -2009,10 +2143,10 @@ export class Painter {
 	 * Decode with TAEF2 into this.taef2.texture: the current latent, or with sigma > 0 the picture the painter has in
 	 * mind after a step (x0 = latent - sigma x velocity, sigma the step's new noise level).
 	 */
-	async decode(sigma = 0) {
+	async decode(sigma = 0, clean?: Float32Array) {
 		// unpatchify: token (h, w), channel 4c + 2dy + dx -> latent pixel (2h + dy, 2w + dx) of channel c
-		const lat = await this.read(this.at.lat, NI * CIN);
-		if (sigma > 0) {
+		const lat = clean ?? (await this.read(this.at.lat, NI * CIN));
+		if (!clean && sigma > 0) {
 			const vel = await this.read(this.at.vel, NI * CIN);
 			for (let i = 0; i < lat.length; i++) lat[i] -= sigma * vel[i];
 		}

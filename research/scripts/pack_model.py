@@ -226,6 +226,8 @@ def main():
     ap.add_argument('--lora-source', default='radames/FLUX.2-klein-Sana-Sprint', help='where the LoRA comes from')
     ap.add_argument('--lora-rank', type=int, default=64, help="keep the LoRA's best rank-r approximation")
     ap.add_argument('--schedules', default='1,2,3,4', help="other step counts to carry (from the bundle's schedules)")
+    ap.add_argument('--rdm', help="a 1-step side branch: rdm_delta.py's rank-256 SVD of RDM - klein (schedule '1r')")
+    ap.add_argument('--rdm-rank', type=int, default=32, help="keep the 1-step change's best rank-r approximation")
     args = ap.parse_args()
     fused = None
     if args.fused:
@@ -367,19 +369,20 @@ def main():
         allm = json.load(open(sj))['512']
         data = np.fromfile(os.path.join(PAINTER, 'schedules.bin'), dtype=np.float32)
         parts_s, at = [], 0
-        for n in [int(x) for x in args.schedules.split(',')]:
-            m = allm[str(n)]
+        keys = args.schedules.split(',') + (['1r'] if args.rdm else [])
+        for key in keys:
+            m, n = allm[key], len(allm[key]['sigmas']) - 1
             parts_s.append(data[m['offset']:m['offset'] + n * m['rows'] * 3072])
-            sched_meta[str(n)] = dict(sigmas=m['sigmas'], mu=m['mu'], rows=m['rows'], offset=at)
+            sched_meta[key] = dict(sigmas=m['sigmas'], mu=m['mu'], rows=m['rows'], offset=at)
             at += n * m['rows'] * 3072
         w.add('sched.mod', (3072, at // 3072), F32, np.concatenate(parts_s).tobytes())
-    lora_meta = None
-    if args.lora:
+
+    def add_lora(prefix, path, r):
+        """A LoRA's best rank-r approximation as side-branch tensors <prefix>.<module>.a / .bt; returns (modules, meta)."""
         import torch
         from safetensors import safe_open
-        r = args.lora_rank
         n_lora = 0
-        with safe_open(args.lora, 'pt') as f:
+        with safe_open(path, 'pt') as f:
             meta = f.metadata() or {}
             scale = float(meta.get('alpha', 1)) / float(meta.get('rank', 1)) if 'alpha' in meta else 1.0
             for m in sorted({k.rsplit('.lora_', 1)[0] for k in f.keys()}):
@@ -398,15 +401,29 @@ def main():
                     h = np.ascontiguousarray(x).astype(np.float16)
                     assert np.isfinite(h).all()
                     u = h.view(np.uint16)
-                    w.add(f'lora.{name}.{suffix}', (x.shape[1], x.shape[0]), F16_PLANES,
+                    w.add(f'{prefix}.{name}.{suffix}', (x.shape[1], x.shape[0]), F16_PLANES,
                           (u >> 8).astype(np.uint8).tobytes() + (u & 0xFF).astype(np.uint8).tobytes())
                 n_lora += 1
+        return n_lora, meta
+
+    lora_meta = rdm_meta = None
+    if args.lora:
+        r = args.lora_rank
+        n_lora, meta = add_lora('lora', args.lora, r)
         lora_meta = dict(rank=r, modules=n_lora, steps=[1, 2], scale=1.0,
                          source=args.lora_source,
                          method=meta.get('method', ''), license='apache-2.0',
                          note=f'the LoRA\'s best rank-{r} approximation (SVD of B A per module); '
                               'y = W x + B (A x), on for 1 and 2 steps')
         print(f'lora: {n_lora} modules at rank {r}')
+    if args.rdm:
+        n_rdm, _ = add_lora('rdm', args.rdm, args.rdm_rank)
+        rdm_meta = dict(rank=args.rdm_rank, modules=n_rdm, schedule='1r', scale=1.0,
+                        source='epfl-vita/flux2-klein-1step-rdm', base='black-forest-labs/FLUX.2-klein-4B',
+                        note=f'RDM - klein for the {n_rdm} big matrices, its best rank-{args.rdm_rank} approximation, '
+                             "as y = W x + B (A x); with schedule '1r' (the modulation from RDM's own time and "
+                             'modulation weights) it paints in 1 step')
+        print(f'rdm: {n_rdm} modules at rank {args.rdm_rank}')
 
     # ---- what the runtime needs to know
     painter = {k: man[k] for k in ('text', 'image', 'schedule', 'taef2', 'config') if k in man}
@@ -421,6 +438,8 @@ def main():
         w.string('mindview.schedules', json.dumps({'512': sched_meta}))
     if lora_meta:
         w.string('mindview.lora', json.dumps(lora_meta))
+    if rdm_meta:
+        w.string('mindview.rdm', json.dumps(rdm_meta))
     w.string('mindview.trits', TRIT_DOC)
     w.string('mindview.deflate', DEFLATE_DOC)
     w.string('mindview.stored', json.dumps({n: len(d) for n, _, ty, d in w.tensors if ty == DEFLATE}))
@@ -431,13 +450,16 @@ def main():
         'decoder': 'madebyollin/taef2',
         **({'lora': f'{args.lora_source} (Apache 2.0), rank {args.lora_rank} of 256, for 1 and 2 steps'}
            if args.lora else {}),
+        **({'rdm': f'epfl-vita/flux2-klein-1step-rdm minus black-forest-labs/FLUX.2-klein-4B, rank {args.rdm_rank}, '
+                   'for 1 step'} if args.rdm else {}),
     }))
 
     total = w.write(args.out)
     parts = {}
     for n, _, ty, d in w.tensors:
         k = 'reader' if n.startswith(('token_embd', 'blk.', 'output_norm', 'tokenizer')) else 'cond' if n.startswith('cond.') \
-            else 'decoder' if n.startswith('taef2') else 'lora' if n.startswith('lora.') else 'dit'
+            else 'decoder' if n.startswith('taef2') else 'lora' if n.startswith('lora.') \
+            else 'rdm' if n.startswith('rdm.') else 'dit'
         parts[k] = parts.get(k, 0) + len(d)
     print('stored: ' + ', '.join(f'{k} {v / 1e6:.1f} MB' for k, v in parts.items()))
     print(f'wrote {args.out}: {total / 1e6:.1f} MB ({total / 2**30:.3f} GiB), {len(w.tensors)} tensors')

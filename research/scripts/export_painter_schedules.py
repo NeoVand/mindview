@@ -6,7 +6,7 @@ Writes static/models/bonsai-image-4b/schedules.bin (f32) + schedules.json:
   { "512": { "<steps>": { sigmas: [...], offset: <floats>, rows: 17 } } }  each step: [17, 3072] =
   double_img (6) | double_txt (6) | single (3) | norm_out (2), in the same order the browser keeps them.
 """
-import glob, json, math
+import glob, json, math, os
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -52,6 +52,32 @@ for size in [512]:
         meta[str(size)][str(steps)] = dict(sigmas=sigmas.tolist(), mu=mu, offset=offset, rows=17)
         offset += a.size
         print(size, steps, 'sigmas', [round(x, 4) for x in sigmas.tolist()])
+# '1r': 1 step with EPFL's 1-step fine-tune (epfl-vita/flux2-klein-1step-rdm): the same modules plus RDM's change from
+# klein (RDM - klein, added to the ternary model's weights; see rdm_delta.py), at sigma 1
+RDM_OTHER, KLEIN = 'data/rdm/rdm_other.safetensors', glob.glob(
+    '/Users/neo/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/transformer/')
+if os.path.exists(RDM_OTHER) and KLEIN:
+    fo, fk = safe_open(RDM_OTHER, 'pt'), safe_open(KLEIN[0] + 'diffusion_pytorch_model.safetensors', 'pt')
+
+    def load_rdm(mod, prefix):
+        mod.load_state_dict({k: DT.get_tensor(f'{prefix}.{k}').float() + fo.get_tensor(f'{prefix}.{k}').float()
+                             - fk.get_tensor(f'{prefix}.{k}').float() for k in mod.state_dict()})
+        return mod.float().eval()
+
+    r_temb = load_rdm(Flux2TimestepGuidanceEmbeddings(cfg['timestep_guidance_channels'], D, bias=False, guidance_embeds=False), 'time_guidance_embed')
+    r_img, r_txt = load_rdm(Flux2Modulation(D, 2), 'double_stream_modulation_img'), load_rdm(Flux2Modulation(D, 2), 'double_stream_modulation_txt')
+    r_single = load_rdm(Flux2Modulation(D, 1), 'single_stream_modulation')
+    r_out = load_rdm(AdaLayerNormContinuous(D, D, elementwise_affine=False, eps=cfg['eps'], bias=False), 'norm_out')
+    with torch.no_grad():
+        temb = r_temb(torch.tensor([1000.0]), None)
+        rows = torch.cat([r_img(temb).reshape(-1, 6, D), r_txt(temb).reshape(-1, 6, D), r_single(temb).reshape(-1, 3, D),
+                          r_out.linear(r_out.silu(temb)).reshape(-1, 2, D)], 1)
+    a = rows.numpy().astype('<f4')
+    blobs.append(a.tobytes())
+    meta['512']['1r'] = dict(sigmas=[1.0, 0.0], mu=None, offset=offset, rows=17,
+                             source='epfl-vita/flux2-klein-1step-rdm (its change from klein, on the ternary weights)')
+    offset += a.size
+    print('1r: RDM 1-step modulation')
 open(f'{OUT}/schedules.bin', 'wb').write(b''.join(blobs))
 json.dump(meta, open(f'{OUT}/schedules.json', 'w'), indent=1)
 print('wrote schedules', offset * 4 / 1e6, 'MB')

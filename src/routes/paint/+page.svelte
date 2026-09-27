@@ -1,6 +1,6 @@
 <script module lang="ts">
 	import type { BonsaiLLM } from '$lib/runtime/bonsai-llm';
-	import type { Painter } from '$lib/runtime/painter';
+	import type { Painter, Schedule } from '$lib/runtime/painter';
 
 	// the model, loaded once and kept while the site is open (coming back to this page does not load it again)
 	let model: Promise<{ llm: BonsaiLLM; painter: Painter; megabytes: number }> | undefined;
@@ -24,9 +24,11 @@
 	let painted = $state(false);
 	let result = $state('');
 	let error = $state<string | null>(null);
-	// fast: 2 steps with the few-step LoRA (when the model has it); best: 4 steps
-	let mode = $state<'fast' | 'best'>('fast');
+	// instant: 1 step with the 1-step fine-tune (when the model has it); fast: 2 steps with the few-step LoRA, the first
+	// at 256 x 256 (when the model has it); best: 4 steps
+	let mode = $state<'instant' | 'fast' | 'best'>('fast');
 	let fastAvailable = $state(false);
+	let instantAvailable = $state(false);
 	let canvas: HTMLCanvasElement | undefined;
 	let device: GPUDevice | undefined;
 
@@ -65,6 +67,7 @@
 			if (!alive) return;
 			ready = true;
 			fastAvailable = (await load()).painter.hasLora;
+			instantAvailable = (await load()).painter.hasOneStep;
 			progress = null;
 			status = `The model is ready (${megabytes} MB, one file). Type something and paint it.`;
 		})().catch((e) => {
@@ -106,18 +109,23 @@
 		try {
 			const { llm, painter } = await load();
 			const t0 = performance.now();
-			const steps = fastAvailable && mode === 'fast' ? 2 : 4;
-			painter.setSteps(steps);
-			// at 2 steps the pads matter more: keep 256 text rows (4 steps need only the prompt and a few)
-			painter.textLength = steps === 2 ? 256 : 'auto';
+			const schedule: Schedule =
+				instantAvailable && mode === 'instant' ? '1r' : fastAvailable && mode === 'fast' ? 2 : 4;
+			painter.setSteps(schedule);
+			const steps = painter.steps;
+			// at 1 or 2 steps the pads matter more: keep 256 text rows (4 steps need only the prompt and a few)
+			painter.textLength = steps <= 2 ? 256 : 'auto';
 			status = 'Reading your words';
 			await painter.encode(llm, text);
-			painter.setNoise(undefined, seed);
+			// 2 steps: the first sketches at 256 x 256 (a quarter of the work), the second paints at full size
+			const low = steps === 2;
+			painter.setNoise(undefined, seed, low);
 			for (let s = 0; s < steps; s++) {
-				status = `Painting: step ${s + 1} of ${steps}`;
+				status = steps === 1 ? 'Painting, in one step' : `Painting: step ${s + 1} of ${steps}`;
 				await painter.step(s);
 				// what it has in mind after this step (after the last: the picture itself)
-				await painter.decode(painter.sigmas[s + 1]);
+				if (low && s === 0) await painter.decode(0, await painter.upsampleLatent(seed + 1));
+				else await painter.decode(painter.sigmas[s + 1]);
 				await show(painter);
 			}
 			const secs = ((performance.now() - t0) / 1000).toFixed(1);
@@ -164,7 +172,7 @@
 	<title>Paint</title>
 	<meta
 		name="description"
-		content="A text-to-image model in one file under 1 GB, running in your browser: type something and it paints it."
+		content="A text-to-image model in one file of about 1 GB, running in your browser: type something and it paints it."
 	/>
 </svelte:head>
 
@@ -194,6 +202,12 @@
 				<button type="button" onclick={newSeed} disabled={!ready || painting}>New seed</button>
 				{#if fastAvailable}
 					<div class="mode" role="radiogroup" aria-label="Speed">
+						{#if instantAvailable}
+							<label class:on={mode === 'instant'}>
+								<input type="radio" bind:group={mode} value="instant" disabled={painting} />Instant,
+								1 step
+							</label>
+						{/if}
 						<label class:on={mode === 'fast'}>
 							<input type="radio" bind:group={mode} value="fast" disabled={painting} />Fast, 2 steps
 						</label>
@@ -231,10 +245,11 @@
 
 	<section class="about">
 		<p>
-			One file of under a gigabyte paints this, on your GPU, in this tab. Ternary Bonsai 1.7B reads
+			One file of about a gigabyte paints this, on your GPU, in this tab. Ternary Bonsai 1.7B reads
 			your words with its first 9 layers; a linear map turns them into the painter's conditioning;
-			the ternary diffusion transformer of Bonsai Image 4B paints in four steps; TAEF2 turns the
-			result into pixels. Nearly every weight is −1, 0 or +1.
+			the ternary diffusion transformer of Bonsai Image 4B paints in four steps, or in two or one
+			with small side branches learned for few steps; TAEF2 turns the result into pixels. Nearly
+			every weight is −1, 0 or +1.
 		</p>
 		<p class="links">
 			<a href={HF}>The model on Hugging Face</a>

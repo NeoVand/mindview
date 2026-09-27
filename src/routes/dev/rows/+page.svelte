@@ -1,14 +1,14 @@
 <script lang="ts">
 	// The one-file model painting the same prompts several ways, side by side, with the time of each painting. Each
-	// column is steps/text rows[/precision]: ?cols=4/512,4/auto/f32,2/auto (1 or 2 steps turn the few-step LoRA on when the file has
-	// it). ?file= picks a file in static/models/mindview-t2i/ instead of the default model.
+	// column is steps/text rows[/precision[/p]]: ?cols=4/512,4/auto/f32,2/auto,2/256/f16/p (1 or 2 steps turn the few-step
+	// LoRA on when the file has it; 1r is 1 step with the 1-step fine-tune; p runs the first step at 256 x 256). ?file= picks a file in static/models/mindview-t2i/ instead of the default model.
 	import { asset } from '$app/paths';
 	import { page } from '$app/state';
 	import { labDevice } from '$lib/lab/shared';
 	import { packedUrl } from '$lib/models';
 	import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
 	import { PackedModel } from '$lib/runtime/packed';
-	import { Painter } from '$lib/runtime/painter';
+	import { Painter, type Schedule } from '$lib/runtime/painter';
 
 	const PROMPTS = [
 		'a bonsai tree made of glowing circuitry in a dark museum, volumetric light',
@@ -23,9 +23,11 @@
 	const q = page.url.searchParams;
 	const lengths = (q.get('cols') ?? '4/512,4/auto').split(',');
 	const parse = (c: string) => {
-		const [steps, rows, precision] = c.split('/');
+		const [steps, rows, precision, low] = c.split('/');
 		return {
-			steps: Number(steps),
+			low: low === 'p',
+			schedule: (steps === '1r' ? '1r' : Number(steps)) as Schedule,
+			steps: steps === '1r' ? 1 : Number(steps),
 			rows: rows === 'auto' ? ('auto' as const) : Number(rows),
 			precision: (precision ?? 'f16') as 'f32' | 'f16'
 		};
@@ -64,15 +66,18 @@
 		for (const p of PROMPTS)
 			for (const l of lengths) {
 				status = `${l}: ${p}`;
-				const { steps, rows, precision } = parse(l);
+				const { schedule, steps, rows, precision, low } = parse(l);
 				painter.textLength = rows;
 				painter.precision = precision;
-				painter.setSteps(steps);
+				painter.setSteps(schedule);
 				const t0 = performance.now();
 				await painter.encode(llm, p);
 				const t1 = performance.now();
-				painter.setNoise(undefined, seed);
-				for (let s = 0; s < steps; s++) await painter.step(s);
+				painter.setNoise(undefined, seed, low);
+				for (let s = 0; s < steps; s++) {
+					await painter.step(s);
+					if (low && s === 0) await painter.upsampleLatent(seed + 1);
+				}
 				await device.queue.onSubmittedWorkDone();
 				const t2 = performance.now();
 				await painter.decode();
@@ -107,7 +112,10 @@
 		<thead>
 			<tr>
 				<th></th>
-				{#each lengths as l (l)}<th>{parse(l).steps} steps, {parse(l).rows} text rows</th>{/each}
+				{#each lengths as l (l)}<th>
+						{parse(l).schedule === '1r' ? '1 step (RDM)' : `${parse(l).steps} steps`}, {parse(l)
+							.rows} text rows{parse(l).low ? ', first at 256' : ''}
+					</th>{/each}
 			</tr>
 		</thead>
 		<tbody>
