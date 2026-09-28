@@ -1,5 +1,7 @@
 # mindview
 
+![A recorded run of the landing, at about four times its speed: the words as threads through the reader's layers, then the painter's sketch and picture, to the finished picture with each word's reading around it](docs/threads.gif)
+
 mindview is an art installation that runs two neural networks in your browser and shows them working. A language
 model reads your words and a diffusion model paints them, and you watch every layer do it: each word travels as a
 thread through the reader's layers, then the painter reads the words, block by block, as the picture forms. Nothing on
@@ -13,8 +15,6 @@ paints in one, two or four steps. On a MacBook Air (M4) a picture takes about 4,
 **Live:** [neovand.github.io/mindview](https://neovand.github.io/mindview/) ·
 [paint](https://neovand.github.io/mindview/paint) · [the labs](https://neovand.github.io/mindview/lab) ·
 [the model](https://huggingface.co/mohsenvand/mindview-t2i-turbo)
-
-![The end of the journey: the finished picture, with each word's reading around it](docs/landing.jpg)
 
 ## What you see
 
