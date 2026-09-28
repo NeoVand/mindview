@@ -14,7 +14,8 @@ paints in one, two or four steps. On a MacBook Air (M4) a picture takes about 4,
 
 **Live:** [neovand.github.io/mindview](https://neovand.github.io/mindview/) ·
 [paint](https://neovand.github.io/mindview/paint) · [the labs](https://neovand.github.io/mindview/lab) ·
-[the model](https://huggingface.co/mohsenvand/mindview-t2i-turbo)
+[the model](https://huggingface.co/mohsenvand/mindview-t2i-turbo) ·
+[its Space](https://huggingface.co/spaces/mohsenvand/mindview-t2i-turbo)
 
 ## What you see
 
@@ -155,7 +156,7 @@ softer. The Air has no fan and slows by about a third after minutes of painting.
 | Page                                                             | What it is                                                                                                                                                                                                                                                                                                                                           |
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`/`](https://neovand.github.io/mindview/)                       | The landing: your words as threads through the reader's layers, then into the painter, a sketch and then the picture. The opening prompt plays a recording of a real run; any other prompt runs the one-file model live in your tab.                                                                                                                 |
-| [`/paint`](https://neovand.github.io/mindview/paint)             | Type a prompt and get a picture, in one, two or four steps, from the one-file model.                                                                                                                                                                                                                                                                 |
+| [`/paint`](https://neovand.github.io/mindview/paint)             | Type a prompt and get a picture, in one, two or four steps, from the one-file model. The same page is the model's [Space](https://huggingface.co/spaces/mohsenvand/mindview-t2i-turbo) on Hugging Face.                                                                                                                                              |
 | [`/lab/threads`](https://neovand.github.io/mindview/lab/threads) | The landing's piece on the full pipeline: the reader's layers up to 21, then the painter in four steps, with the picture each block has in mind.                                                                                                                                                                                                     |
 | [`/lab/layer`](https://neovand.github.io/mindview/lab/layer)     | Operation by operation, every number readable. Pick one layer of the reader, or one block of the painter (for a word or a patch of the picture). You see the norms, the projections with their running sums, the rotary turns, attention (in the painter, 24 heads over the prompt and all 1,024 patches), the neurons, and the gated residual adds. |
 | [`/lab/machine`](https://neovand.github.io/mindview/lab/machine) | All 5.1 billion weights (the reader's 1.4 billion, the painter's 3.7 billion) on one wall, one cell each, lit by what they multiply for the word or patch you follow. The picture each block has in mind sits above it, filling in as it paints.                                                                                                     |
@@ -199,6 +200,9 @@ Other commands:
 - `pnpm check`: type-check.
 - `pnpm lint`: formatting and lint.
 - `pnpm build`: build the static site into `build/`. Set `BASE_PATH=/mindview` to serve it from a folder.
+- `pnpm space:paint`: build the Paint page on its own into `spaces/paint/dist`, for the Hugging Face Space (a static
+  Space; its card is `spaces/paint/public/README.md`). Upload it with
+  `hf upload mohsenvand/mindview-t2i-turbo spaces/paint/dist . --repo-type space`.
 
 <details>
 <summary>Rebuilding the one-file model</summary>
