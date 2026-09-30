@@ -734,7 +734,7 @@ export class BonsaiLLM {
 		if (scheduler) {
 			// the uniforms go in with the first slice; the slices follow one another in the queue
 			const cost = (cmd: (typeof cmds)[number]) =>
-				cmd.pipe === this.pipes.matmul ? (2 * cmd.p[0] * cmd.p[1] * cmd.p[2]) / 1e8 : 0.3;
+				cmd.pipe === this.pipes.matmul ? gemmMs(cmd.p[0], cmd.p[1], cmd.p[2]) : 0.3;
 			const tasks: GpuTask[] = [];
 			let group: number[] = [],
 				acc = 0;

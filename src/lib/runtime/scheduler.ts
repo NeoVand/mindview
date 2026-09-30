@@ -88,6 +88,8 @@ export class GpuScheduler {
 	private gen = 0;
 	/** Milliseconds of estimated GPU work to submit per frame. */
 	budget = 6;
+	/** The least work per frame, even after late frames: owners raise it when nothing on screen needs to stay smooth. */
+	floor = 3;
 	readonly timer: GpuTimer;
 	/** Size tasks are cut to (owners read this when they build tasks); one task holds up a frame at most this long. */
 	readonly slice = 6;
@@ -140,8 +142,8 @@ export class GpuScheduler {
 		if (!this.queue.length) return;
 		// find the most work per frame that keeps frames on time: a little more after every frame that came on time, a
 		// good deal less after one that came late (display frames are 16.7 ms apart; a late one shows as 33)
-		if (frame > 24) this.budget = Math.max(1.5, this.budget * 0.8);
-		else this.budget = Math.min(40, this.budget + 0.04);
+		if (frame > 24) this.budget = Math.max(this.floor, this.budget * 0.8);
+		else this.budget = Math.min(40, Math.max(this.floor, this.budget + 0.15));
 		if (this.inflight >= IN_FLIGHT) return;
 		const gen = this.gen;
 		const sub = ++this.sub;

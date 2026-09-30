@@ -84,7 +84,8 @@ struct P { rows: u32, K: u32, codes: u32, scales: u32, out: u32, _a: u32, _b: u3
 }`;
 
 // timeline: how long each layer takes to grow (seconds)
-const layerDur = (l: number) => (l === 0 ? 7 : l === 1 ? 4 : 2.2);
+const layerDur = (l: number) => (l === 0 ? 4.5 : l === 1 ? 2.5 : 1.4);
+const HANDOFF_SECS = 2; // the ride's time through the handoff, once the reader's animation is done
 
 export class Threads {
 	private post: Post;
@@ -134,6 +135,7 @@ export class Threads {
 	private palette = new Float32Array(256 * 4);
 	private threadPos: V3[][] = [];
 	private paintFront = 0; // ticks shown so far (smoothed)
+	private handoffAt = -1; // time at which the reader's animation ended and the ride entered the handoff
 	private paintError = '';
 	// a new prompt: the old scene fades out while the new one is read (and nothing is painted from the old one)
 	private reading = false;
@@ -271,9 +273,20 @@ export class Threads {
 		if (!this.ready) return 0;
 		const p = this.progress(this.time);
 		if (p < this.layers || !this.canPaint) return p;
-		if (!this.painting || this.painting.encoded < 1 || this.painting.ticks < 1)
-			return this.layers + HANDOFF * (this.painting ? this.painting.encoded : 0);
+		const h = this.handoffProgress;
+		if (h < 1) return this.layers + HANDOFF * h;
 		return this.layers + HANDOFF + this.paintFront;
+	}
+
+	/**
+	 * How far the ride is through the handoff (0..1): the painter's text side as it is computed, but never faster
+	 * than HANDOFF_SECS once the reader's animation is done (the computation usually runs ahead of the show).
+	 */
+	private get handoffProgress() {
+		if (!this.painting) return 0;
+		const clock = this.handoffAt < 0 ? 0 : (this.time - this.handoffAt) / HANDOFF_SECS;
+		const p = Math.min(this.painting.encoded, clock);
+		return this.painting.ticks >= 1 && p >= 1 ? 1 : Math.min(p, 0.999);
 	}
 
 	/** The visitor turned the camera. */
@@ -304,6 +317,7 @@ export class Threads {
 		this.painting = undefined;
 		this.planes.clear();
 		this.paintFront = 0;
+		this.handoffAt = -1;
 		this.paintError = '';
 		if (this.progress(this.time) >= this.layers) {
 			this.startPainting();
@@ -372,6 +386,7 @@ export class Threads {
 		this.planes.clear();
 		this.scheduler.clear();
 		this.paintFront = 0;
+		this.handoffAt = -1;
 		this.paintError = '';
 		// the reading is long JavaScript work: give frames a turn every few milliseconds, and stop if a newer
 		// prompt has come in meanwhile (breathe() then returns true)
@@ -720,6 +735,9 @@ export class Threads {
 		// the painter uses the words only as they stand after its last tap, so the reader stops there
 		const TAP_LAYERS = this.model.taps;
 		const NL = TAP_LAYERS[TAP_LAYERS.length - 1];
+		const t0 = performance.now(),
+			laps: string[] = [];
+		const lap = (what: string) => laps.push(`${what} ${(performance.now() - t0).toFixed(0)}`);
 		this.say(`Reading your words through ${NL} layers`);
 		const r = await llm.prefill(
 			llm.tokenizer.encode(chatPrompt(prompt)).slice(0, MAX_TOKENS),
@@ -743,7 +761,9 @@ export class Threads {
 		for (let l = 0; l < NL; l++)
 			for (let h = 0; h < H; h++)
 				regions.push({ offset: L.probs + ((l * H + h) * N + W[0]) * N, count: nw * N });
+		lap('prefill');
 		const got = await llm.readMany(regions);
+		lap('readback');
 		if (await breathe()) return null;
 		let k = 0;
 		const resid = Array.from({ length: NL + 1 }, () => W.map(() => got[k++]));
@@ -761,6 +781,7 @@ export class Threads {
 				X.push(x);
 			}
 		const two = await topTwo(X, D, breathe);
+		lap('axes');
 		if (!two) return null;
 		const [e0, e1] = two;
 
@@ -825,6 +846,7 @@ export class Threads {
 		dev.queue.submit([enc.finish()]);
 		await read.mapAsync(GPUMapMode.READ);
 		const proj = new Float32Array(read.getMappedRange()).slice();
+		lap('projection');
 		read.destroy();
 		out.destroy();
 		params.destroy();
@@ -841,6 +863,8 @@ export class Threads {
 			text: clean(llm.tokenizer.decode([lens.ids[k]])),
 			prob: lens.probs[k]
 		}));
+		lap('lens');
+		console.info(`threads reading, ms from the start: ${laps.join(', ')}`);
 		return {
 			tokens: r.tokens,
 			W,
@@ -909,8 +933,9 @@ export class Threads {
 		const prog = this.ready ? this.progress(this.time) : 0;
 		const NL = this.layers;
 		const total = this.journeyLength;
-		// the painter starts when the reader is done
-		if (this.ready && !this.reading && this.canPaint && prog >= NL && !this.painting) {
+		// the painter starts computing as soon as the words are read (the reader's animation is a replay); the show
+		// reaches its work only after the reader's last layer, and never runs ahead of what has been computed
+		if (this.ready && !this.reading && this.canPaint && !this.painting) {
 			this.startPainting();
 			// the painter came after the reader had finished and the whole was on show: ride on into it
 			if (this.mode === 'overview') {
@@ -919,9 +944,17 @@ export class Threads {
 			}
 		}
 		this.painting?.update();
+		if (this.ready && prog >= NL && this.handoffAt < 0) this.handoffAt = this.time;
+		// the GPU queue: bigger slices while nothing on screen needs to stay smooth (the reading, the handoff)
+		this.scheduler.floor =
+			!this.ready || this.reading
+				? 30
+				: this.painting && this.painting.ticks >= 1 && prog >= NL
+					? 3
+					: 10;
 		// fade out while a new prompt is being read, back in when its journey begins
 		this.post.fade += ((this.reading ? 0 : 1) - this.post.fade) * (1 - Math.exp(-dt * 5));
-		if (this.painting?.ticks && !this.paused) {
+		if (this.painting?.ticks && !this.paused && prog >= NL && this.handoffProgress >= 1) {
 			const target = this.painting.done
 				? this.painting.ticksTotal
 				: Math.max(0, this.painting.ticks - 1);
@@ -1146,7 +1179,7 @@ export class Threads {
 				caption = `Looking back at layer ${at} of ${NL}. Each jagged step is the sum of everything that layer added to the word.`;
 			else if (this.ride >= NL && this.ride - NL - HANDOFF < 0.5)
 				caption = this.canPaint
-					? `The reading stops after layer ${NL}: the painter needs nothing later. It takes each word as it stood after layers ${listed(this.model.taps)} (the beads); the reader reads the prompt once more, padded to the ${this.model.textRows} rows the painter expects, and here a linear map merges each word's three states into one (${Math.round((this.painting?.encoded ?? 0) * 100)}%).`
+					? `The reading stops after layer ${NL}: the painter needs nothing later. It takes each word as it stood after layers ${listed(this.model.taps)} (the beads); the reader reads the prompt once more, padded to the ${this.model.textRows} rows the painter expects, and here a linear map merges each word's three states into one (${Math.round(this.handoffProgress * 100)}%).`
 					: 'The painter is still downloading.';
 			else if (inPainter && this.painting && tick >= this.painting.ticksTotal)
 				caption = `The finished picture, decoded from the painter's last latent: ${passes} ${passes === 1 ? 'pass' : 'passes'} of ${this.model.painterWeights} ternary weights, starting from noise.`;

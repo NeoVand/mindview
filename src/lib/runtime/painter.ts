@@ -492,14 +492,14 @@ export class Painter {
 		return this.nt + this.ni;
 	}
 
-	/** A step's shape: image rows (256 for a first step at 256 x 256, see setNoise), text rows, joint rows. */
+	/** A step's shape: image rows (256 for the coarse first steps at 256 x 256, see setNoise), text rows, joint rows. */
 	private dims(s: number) {
-		const ni = this.lowFirst && s === 0 ? 256 : NI;
+		const ni = s < this.low ? 256 : NI;
 		const nt = ni === NI ? this.nt : Math.min(this.nt, this.lowTextRows);
 		return { ni, nt, nj: nt + ni, grid: ni === NI ? 32 : 16 };
 	}
-	/** Whether the painting's first step runs at 256 x 256 (setNoise with low). */
-	private lowFirst = false;
+	/** How many of the painting's first steps run at 256 x 256 (setNoise with low). */
+	private low = 0;
 	private seed = 7;
 	/** Image rows of the current step: 1024 (32 x 32 patches, 512 x 512) or 256 (16 x 16, a first step at 256 x 256). */
 	private ni = NI;
@@ -1005,11 +1005,11 @@ export class Painter {
 
 	/**
 	 * Start from the given noise (image rows x 128, bn-normalised latent space) or from seeded Gaussian noise; with
-	 * low, the first step runs at 256 x 256 (see upsampleLatent).
+	 * low (true, or how many), the first step or steps run at 256 x 256 (see upsampleLatent).
 	 */
-	setNoise(noise?: Float32Array, seed = 7, low = false) {
-		this.ni = low ? 256 : NI;
-		this.lowFirst = low;
+	setNoise(noise?: Float32Array, seed = 7, low: boolean | number = false) {
+		this.low = typeof low === 'number' ? low : low ? 1 : 0;
+		this.ni = this.low ? 256 : NI;
 		this.seed = seed;
 		let z = noise;
 		if (!z) {
@@ -1028,12 +1028,12 @@ export class Painter {
 	}
 
 	/**
-	 * After a first step at 256 x 256: the clean picture it predicts (x0 = latent - sigma1 v), upsampled to 512 x 512 in
-	 * latent space (bilinear, per channel) and noised back to sigma1 with fresh noise, for the next steps at full size.
-	 * Returns the upsampled prediction (for decode).
+	 * After the last coarse step at 256 x 256: the clean picture it predicts (x0 = latent - sigma v), upsampled to
+	 * 512 x 512 in latent space (bilinear, per channel) and noised back to the next step's sigma with fresh noise, for
+	 * the steps at full size. Returns the upsampled prediction (for decode).
 	 */
 	async upsampleLatent(seed = 7): Promise<Float32Array> {
-		const s1 = this.sigmas[1],
+		const s1 = this.sigmas[this.low],
 			n = 256;
 		const lat = await this.read(this.at.lat, n * CIN),
 			vel = await this.read(this.at.vel, n * CIN);
@@ -1586,12 +1586,13 @@ export class Painter {
 			tasks.push(...this.tasks(ops.slice(from, to), budget));
 			from = to;
 			if (b < 0 && onInput && this.hasSpace) tasks.push(this.inputTask(onInput));
-			// without a lens there is no picture per block: when the step is done, its own clean guess is decoded (a
-			// first step at 256 x 256 is enlarged and noised back for the next, see sketchTasks)
+			// without a lens there is no picture per block: when the step is done, its own clean guess is decoded (the
+			// last coarse step at 256 x 256 is enlarged and noised back for the next, see sketchTasks; earlier coarse
+			// steps show their enlarged guess, and keep their latent)
 			if (b === 25 && !lens)
 				tasks.push(
-					...(this.lowFirst && s === 0
-						? this.sketchTasks(stage, budget)
+					...(s < this.low
+						? this.sketchTasks(stage, budget, s === this.low - 1)
 						: this.guessTasks(s, stage, budget))
 				);
 			if (b < 0 || b > 24) continue;
@@ -1636,29 +1637,32 @@ export class Painter {
 	}
 
 	/**
-	 * After a first step at 256 x 256 (setNoise with low): its clean guess enlarged to 512 x 512 in the latent space and
-	 * mixed with fresh noise back to the next sigma, as the next step's latent (all on the GPU, as upsampleLatent does
-	 * on the CPU); the enlarged guess, the sketch, goes through TAEF2 (stages as in stepTasks).
+	 * After a coarse step at 256 x 256 (setNoise with low): its clean guess enlarged to 512 x 512 in the latent space,
+	 * the sketch, goes through TAEF2 (stages as in stepTasks). After the last coarse step (last), the enlarged guess is
+	 * also mixed with fresh noise back to the next step's sigma, as the next step's latent (all on the GPU, as
+	 * upsampleLatent does on the CPU); earlier coarse steps keep their latent.
 	 */
 	sketchTasks(
 		stage: { record?: (enc: GPUCommandEncoder, res: number) => void; done?: (res: number) => void },
-		budget = 9
+		budget = 9,
+		last = true
 	): GpuTask[] {
 		const at = this.at,
-			s1 = this.sigmas[1];
+			s = this.sigmas[this.low];
 		const ops: Op[] = [
 			{
 				k: 'kernel',
 				name: 'x0_unpatch',
 				p: [256 * CIN, at.vel, 0, at.lat, at.vl, 16],
-				f: [s1],
+				f: [s],
 				wg: [(256 * CIN) / 256, 1, 1]
 			},
 			{
 				k: 'kernel',
 				name: 'upsample_sketch',
-				p: [NI * CIN, at.vl, at.noise, at.lat, at.x0],
-				f: [s1],
+				// the enlarged guess into x0; with last, the noised latent into lat (else into vl, thrown away)
+				p: [NI * CIN, at.vl, at.noise, last ? at.lat : at.vl, at.x0],
+				f: [s],
 				wg: [(NI * CIN) / 256, 1, 1]
 			}
 		];
@@ -1666,11 +1670,12 @@ export class Painter {
 			{
 				cost: 1,
 				record: (enc, sub) => {
-					this.device.queue.writeBuffer(
-						this.arena,
-						at.noise * 4,
-						gaussian(NI * CIN, this.seed + 1)
-					);
+					if (last)
+						this.device.queue.writeBuffer(
+							this.arena,
+							at.noise * 4,
+							gaussian(NI * CIN, this.seed + 1)
+						);
 					this.record(ops, enc, sub);
 					this.taef2.copyLatent(enc, this.arena, at.x0);
 				}

@@ -44,7 +44,8 @@
 	let error = $state<string | null>(null);
 	// instant: 1 step with the 1-step fine-tune (when the model has it); fast: 2 steps with the few-step LoRA, the first
 	// at 256 x 256 (when the model has it); best: 4 steps
-	let mode = $state<'instant' | 'fast' | 'best'>('fast');
+	// quick: Best's 4 steps with the first three at 256 x 256 (untrained: about half of Best's time, most prompts as good)
+	let mode = $state<'instant' | 'fast' | 'best' | 'quick'>('fast');
 	let fastAvailable = $state(false);
 	let instantAvailable = $state(false);
 	let canvas: HTMLCanvasElement | undefined;
@@ -135,14 +136,16 @@
 			painter.textLength = steps === 2 ? 256 : 'auto';
 			status = 'Reading your words';
 			await painter.encode(llm, text);
-			// 2 steps: the first sketches at 256 x 256 (a quarter of the work), the second paints at full size
-			const low = steps === 2;
+			// coarse first steps at 256 x 256 (a quarter of the work each): Fast's first, Quick's first three
+			const low = steps === 2 ? 1 : mode === 'quick' ? 3 : 0;
 			painter.setNoise(undefined, seed, low);
 			for (let s = 0; s < steps; s++) {
 				status = steps === 1 ? 'Painting, in one step' : `Painting: step ${s + 1} of ${steps}`;
 				await painter.step(s);
-				// what it has in mind after this step (after the last: the picture itself)
-				if (low && s === 0) await painter.decode(0, await painter.upsampleLatent(seed + 1));
+				// what it has in mind after this step (after the last: the picture itself); the coarse steps before the
+				// last one keep their latent, so nothing is shown for them
+				if (s < low - 1) continue;
+				if (low && s === low - 1) await painter.decode(0, await painter.upsampleLatent(seed + 1));
 				else await painter.decode(painter.sigmas[s + 1]);
 				await show(painter);
 			}
@@ -226,6 +229,9 @@
 						<label class:on={mode === 'best'}>
 							<input type="radio" bind:group={mode} value="best" disabled={painting} />Best, 4 steps
 						</label>
+						<label class:on={mode === 'quick'}>
+							<input type="radio" bind:group={mode} value="quick" disabled={painting} />Quick Best
+						</label>
 					</div>
 				{/if}
 			</div>
@@ -261,7 +267,8 @@
 			your words with its first 9 layers; a linear map turns them into the painter's conditioning;
 			the ternary diffusion transformer of Bonsai Image 4B paints in one, two or four steps, each
 			with a small side branch trained for it; TAEF2 turns the result into pixels. Nearly every
-			weight is −1, 0 or +1.
+			weight is −1, 0 or +1. Quick Best is Best with three of its four steps at a quarter of the
+			size: about half the time, and (still untrained) most prompts come out as well.
 		</p>
 		<p class="links">
 			<a href={HF} {target} {rel}>The model on Hugging Face</a>
