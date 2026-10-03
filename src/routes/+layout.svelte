@@ -13,11 +13,13 @@
 
 	let { children } = $props();
 
-	const path = $derived(page.url.pathname.replace(/\/$/, '') || '/');
-	const at = (p: string) => path === resolve(p as '/');
+	// paths without a trailing slash (the site is served under /mindview/, where the landing is /mindview/)
+	const norm = (p: string) => p.replace(/\/$/, '') || '/';
+	const path = $derived(norm(page.url.pathname));
+	const at = (p: string) => path === norm(resolve(p as '/'));
 	// the bar is on the piece, Paint and the labs (not on the development pages)
 	const site = $derived(
-		at('/') || at('/paint') || at('/lab') || path.startsWith(resolve('/lab') + '/')
+		at('/') || at('/paint') || at('/lab') || path.startsWith(norm(resolve('/lab')) + '/')
 	);
 	const links = $derived([
 		{ href: resolve('/paint'), label: 'Paint', icon: Paintbrush, current: at('/paint') },
@@ -25,7 +27,7 @@
 			href: resolve('/lab'),
 			label: 'Labs',
 			icon: FlaskConical,
-			current: path.startsWith(resolve('/lab'))
+			current: path.startsWith(norm(resolve('/lab')))
 		}
 	]);
 	const LABS = [
