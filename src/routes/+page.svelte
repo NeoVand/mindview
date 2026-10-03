@@ -20,6 +20,7 @@
 	import CirclePlay from '@lucide/svelte/icons/circle-play';
 	import HardDriveDownload from '@lucide/svelte/icons/hard-drive-download';
 	import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
+	import Rotate3d from '@lucide/svelte/icons/rotate-3d';
 
 	const RECORDED = {
 		prompt: 'a bonsai tree made of glowing circuitry in a dark museum, volumetric light',
@@ -50,6 +51,7 @@
 	let done = $state(false);
 	let paused = $state(false);
 	let mounted = $state(false); // the canvas is in the page (the button waits for it)
+	let previewing = $state(false); // the recorded reading turns behind the opening text
 	const mb = (x: number) => Math.round(x).toLocaleString();
 	const recorded = $derived(!record && prompt.trim() === RECORDED.prompt);
 
@@ -72,10 +74,31 @@
 		done = s.done ?? done;
 	}
 
+	/** Where the preview sits beside the opening text: to its right on a wide screen, above it on a phone. */
+	const besideText = (): [number, number] => (innerWidth > 720 ? [0.42, 0.02] : [0, 0.4]);
+
+	/** The recording, fetched once (the preview and the first run both play it). */
+	function theRecording() {
+		recording ??= load(RECORDED.base).catch((e) => {
+			recording = undefined;
+			throw e;
+		});
+		return recording;
+	}
+
 	function mount(c: HTMLCanvasElement) {
 		canvas = c;
 		mounted = true;
 		const detach = attachOrbit(c, () => study);
+		// before anything is run: the recorded run's reading, finished, turning slowly beside the text (if this
+		// browser cannot show it, the page simply stays dark until the visitor starts)
+		(async () => {
+			const [s, rec] = await Promise.all([piece(), theRecording(), ensureFonts()]);
+			if (stage !== 'intro') return;
+			s.idleShift = besideText();
+			await s.preview(rec);
+			previewing = true;
+		})().catch((e) => console.info('no preview:', e instanceof Error ? e.message : e));
 		return () => {
 			detach();
 			study?.destroy();
@@ -124,11 +147,7 @@
 					stage = 'loading';
 					loading = 'Loading the recording';
 				}
-				recording ??= load(RECORDED.base).catch((e) => {
-					recording = undefined;
-					throw e;
-				});
-				const [s, rec] = await Promise.all([piece(), recording, ensureFonts()]);
+				const [s, rec] = await Promise.all([piece(), theRecording(), ensureFonts()]);
 				stage = 'journey';
 				playing = true;
 				shown = text;
@@ -205,7 +224,12 @@
 		content="A ternary language model reads your words and a ternary diffusion model paints them, in your browser, and you watch every layer compute."
 	/>
 </svelte:head>
-<svelte:window {onkeydown} />
+<svelte:window
+	{onkeydown}
+	onresize={() => {
+		if (study) study.idleShift = besideText();
+	}}
+/>
 
 <main class:intro={stage === 'intro'}>
 	<canvas
@@ -267,6 +291,16 @@
 			{/if}
 		{/if}
 	</form>
+
+	{#if stage === 'intro' && previewing}
+		<p class="behind hint">
+			<Rotate3d />
+			<span
+				>The threads of {recorded ? "this prompt's" : "the opening prompt's"} reading, from the recorded
+				run. Drag to turn them.</span
+			>
+		</p>
+	{/if}
 
 	{#if blocked}
 		<NeedsComputer
@@ -372,7 +406,25 @@
 		margin-top: 0.6rem;
 		max-width: none;
 	}
+	.behind {
+		position: absolute;
+		right: var(--gutter);
+		bottom: max(1.25rem, env(safe-area-inset-bottom));
+		max-width: 22rem;
+		pointer-events: none;
+		animation: arrive 1.2s ease both;
+	}
+	@keyframes arrive {
+		from {
+			opacity: 0;
+		}
+	}
 	@media (max-width: 720px) {
+		.behind {
+			top: var(--top);
+			bottom: auto;
+			left: var(--gutter);
+		}
 		.ask.start {
 			top: auto;
 			bottom: max(1.5rem, env(safe-area-inset-bottom));

@@ -119,13 +119,26 @@ export class Threads {
 	paused = false;
 	// the camera rides alongside the front ('live'), then shows the whole ('overview'), then travels back through
 	// the finished past ('rewind'); the visitor can take the ride position ('manual') and turn / zoom at any time
-	mode: 'live' | 'finale' | 'overview' | 'rewind' | 'manual' = 'live';
+	// before a run, the landing shows a recorded reading, finished and turning slowly ('idle', see preview)
+	mode: 'live' | 'finale' | 'overview' | 'rewind' | 'manual' | 'idle' = 'live';
 	ride = 0; // where along the journey the camera is, in layers
 	private modeTime = 0;
 	private rewound = false;
 	private yawOff = 0;
 	private pitchOff = 0;
 	private distMul = 1;
+	private panOff: V3 = [0, 0, 0]; // the visitor moved the view (world units)
+	// the last frame's camera, for turning a drag on the screen into a move in the world
+	private view = {
+		right: [1, 0, 0] as V3,
+		up: [0, 1, 0] as V3,
+		dist: 12,
+		fov: (38 * Math.PI) / 180
+	};
+	private idling = false; // a preview (see preview)
+	/** While previewing: where the picture sits on the screen (clip space, -1..1), beside the page's own text. */
+	idleShift: [number, number] = [0, 0];
+	private shift: [number, number] = [0, 0];
 	private cam = { c: [0, 0, 0] as V3, dist: 12, yaw: 0.5, pitch: 0.2 };
 	private idle = 0; // seconds since the visitor last touched anything
 	// the painter, once it has downloaded: it paints when the reader is done
@@ -306,11 +319,25 @@ export class Threads {
 		this.idle = 0;
 	}
 
+	/** The visitor moved the view (dx, dy in CSS pixels): the world under the pointer follows it. */
+	pan(dx: number, dy: number) {
+		const { right, up, dist, fov } = this.view;
+		const k = (dist * 2 * Math.tan(fov / 2)) / Math.max(1, this.gpu.canvas.clientHeight);
+		for (let i = 0; i < 3; i++) this.panOff[i] += (-right[i] * dx + up[i] * dy) * k;
+		this.idle = 0;
+	}
+
+	/** Forget where the visitor moved the view (each of the piece's own views starts centred). */
+	private recentre() {
+		this.panOff = [0, 0, 0];
+	}
+
 	/** The visitor moved along the journey (in layers); the computation already done stays drawn. */
 	rideTo(layer: number) {
 		this.ride = Math.max(0, Math.min(this.front, layer));
 		this.cam.c = [this.xAt(this.ride), 0, 0];
 		this.mode = 'manual';
+		this.recentre();
 		this.idle = 0;
 	}
 
@@ -336,6 +363,7 @@ export class Threads {
 		this.ride = this.front;
 		this.mode = 'rewind';
 		this.modeTime = 0;
+		this.recentre();
 		this.idle = 0;
 	}
 
@@ -343,6 +371,8 @@ export class Threads {
 	follow() {
 		this.mode = this.front >= this.journeyLength - 0.01 ? 'overview' : 'live';
 		this.modeTime = 0;
+		this.recentre();
+		this.distMul = 1;
 		this.idle = 0;
 	}
 
@@ -352,6 +382,8 @@ export class Threads {
 		this.ride = this.front;
 		this.mode = 'finale';
 		this.modeTime = 0;
+		this.recentre();
+		this.distMul = 1;
 		this.idle = 0;
 	}
 
@@ -379,8 +411,17 @@ export class Threads {
 		return this.run(rec.prompt, rec);
 	}
 
-	private async run(prompt: string, rec?: Recording) {
+	/**
+	 * Before a run: a recorded run's reading, finished (every thread drawn as the run left it), turning slowly, with
+	 * nothing painted. A run (play, read) starts from the beginning.
+	 */
+	preview(rec: Recording) {
+		return this.run(rec.prompt, rec, true);
+	}
+
+	private async run(prompt: string, rec?: Recording, idle = false) {
 		const id = ++this.readId;
+		this.idling = idle;
 		this.reading = true;
 		this.prompt = prompt;
 		this.playback = rec;
@@ -701,6 +742,7 @@ export class Threads {
 		this.rewound = false;
 		this.yawOff = this.pitchOff = 0;
 		this.distMul = 1;
+		this.recentre();
 		this.starts = [];
 		let t = 1.5;
 		for (let l = 0; l < NL; l++) {
@@ -710,6 +752,11 @@ export class Threads {
 		this.starts.push(t);
 		this.total = t + 4;
 		this.time = 0;
+		if (idle) {
+			// the reading as the run left it
+			this.time = this.starts[NL] + 1;
+			this.mode = 'idle';
+		}
 		this.ready = true;
 		this.reading = false;
 		console.info(`threads: ${nw} words, ${(nv / 1e6).toFixed(2)}M vertices`);
@@ -923,7 +970,8 @@ export class Threads {
 	private loop = (now: number) => {
 		const dt = Math.min(0.1, (now - this.last) / 1000);
 		this.last = now;
-		if (!this.paused && this.ready) this.time = Math.min(this.time + dt, this.total);
+		if (!this.paused && this.ready && !this.idling)
+			this.time = Math.min(this.time + dt, this.total);
 		this.idle += dt;
 		this.scheduler.pump();
 		this.raf = requestAnimationFrame(this.loop);
@@ -941,7 +989,7 @@ export class Threads {
 		const total = this.journeyLength;
 		// the painter starts computing as soon as the words are read (the reader's animation is a replay); the show
 		// reaches its work only after the reader's last layer, and never runs ahead of what has been computed
-		if (this.ready && !this.reading && this.canPaint && !this.painting) {
+		if (this.ready && !this.reading && !this.idling && this.canPaint && !this.painting) {
 			this.startPainting();
 			// the painter came after the reader had finished and the whole was on show: ride on into it
 			if (this.mode === 'overview') {
@@ -1036,15 +1084,29 @@ export class Threads {
 			// face the finished picture
 			want = { c: this.painting.finalAt, dist: 33, yaw: 0, pitch: 0.02 };
 		}
+		const aspect = canvas.width / canvas.height;
 		if (this.mode === 'overview') {
 			const a = this.xAt(0),
 				z = this.painting ? this.painting.finalAt[0] + 14 : this.xAt(total);
-			// nearly side on and a little from above, so the whole journey runs across the screen, turning very slowly
+			// nearly side on and a little from above, so the whole journey runs across the screen, turning very slowly; on
+			// a screen held upright, far enough back for its whole length to fit the width, slanting down the screen
+			const upright = aspect < 0.9;
 			want = {
 				c: [(a + z) / 2, 2, 0],
-				dist: (z - a) * 0.92,
-				yaw: 0.18 + 0.08 * Math.sin(this.modeTime * 0.05),
-				pitch: 0.3
+				dist: (z - a) * 0.92 * (upright ? (1.6 / aspect) * 0.9 : 1),
+				yaw: (upright ? 0.42 : 0.18) + 0.08 * Math.sin(this.modeTime * 0.05),
+				pitch: upright ? 0.42 : 0.3
+			};
+		}
+		if (this.mode === 'idle') {
+			// before a run: the finished reading, turning slowly all the way round and gently up and down
+			const a = this.xAt(0),
+				z = this.xAt(NL);
+			want = {
+				c: [(a + z) / 2, 0, 0],
+				dist: Math.max(16, (z - a) * 1.25 + 10),
+				yaw: 0.6 + this.modeTime * 0.07,
+				pitch: 0.22 + 0.1 * Math.sin(this.modeTime * 0.11)
 			};
 		}
 		if (prog < 1 && this.mode === 'live') want.dist = Math.max(10, fit * 0.85);
@@ -1055,10 +1117,14 @@ export class Threads {
 		cam.yaw += (want.yaw - cam.yaw) * k;
 		cam.pitch += (want.pitch - cam.pitch) * k;
 		// the views are framed for a landscape screen; on a narrower one (a phone held upright) step back until the
-		// same width fits
-		const aspect = canvas.width / canvas.height;
-		const narrow = Math.max(1, Math.pow(1.45 / aspect, 0.85));
-		const target = cam.c,
+		// same width fits (the overview on such a screen is framed for it already)
+		const narrow =
+			this.mode === 'overview' && aspect < 0.9 ? 1 : Math.max(1, Math.pow(1.45 / aspect, 0.85));
+		const target: V3 = [
+				cam.c[0] + this.panOff[0],
+				cam.c[1] + this.panOff[1],
+				cam.c[2] + this.panOff[2]
+			],
 			yaw = cam.yaw + this.yawOff,
 			pitch = Math.max(-1.4, Math.min(1.4, cam.pitch + this.pitchOff)),
 			dist = cam.dist * this.distMul * narrow;
@@ -1068,13 +1134,30 @@ export class Threads {
 			target[2] + dist * Math.cos(pitch) * Math.cos(yaw)
 		];
 		const fov = (38 * Math.PI) / 180;
+		// the picture moved on the screen: while previewing, beside the landing's text; the whole journey on a screen
+		// held upright, a little up, clear of the caption below it
+		const sh = this.idling
+			? this.idleShift
+			: this.mode === 'overview' && aspect < 0.9
+				? [0, 0.2]
+				: [0, 0];
+		const ke = 1 - Math.exp(-dt * 2);
+		this.shift = [
+			this.shift[0] + (sh[0] - this.shift[0]) * ke,
+			this.shift[1] + (sh[1] - this.shift[1]) * ke
+		];
 		const vp = mat4.multiply(
-			mat4.perspective(fov, aspect, 0.05, 500),
+			mat4.multiply(
+				mat4.translation([this.shift[0], this.shift[1], 0]),
+				// far enough for the whole journey seen from a long way off
+				mat4.perspective(fov, aspect, 0.05, Math.max(500, dist * 3))
+			),
 			mat4.lookAt(eye, target, [0, 1, 0])
 		);
 		const fwd = vec3.normalize(vec3.subtract(target, eye));
 		const right = vec3.normalize(vec3.cross(fwd, [0, 1, 0]));
 		const up = vec3.cross(right, fwd);
+		this.view = { right: [...right] as V3, up: [...up] as V3, dist, fov };
 		const f = new Float32Array(FRAME_BYTES / 4);
 		f.set(vp, 0);
 		f.set([...right, 0], 16);
@@ -1198,8 +1281,8 @@ export class Threads {
 					: `Your words, painted: ${this.model.readerWeights} ternary weights read them, ${this.model.painterWeights} turned noise into this in ${passes} ${passes === 1 ? 'pass' : 'passes'}, all in this browser tab.`;
 			else if (this.mode === 'overview')
 				caption = this.painting?.done
-					? `The whole journey: ${this.model.readerWeights} weights read your ${this.wordCount} words, ${this.model.painterWeights} painted them. Drag to turn, scroll to come closer, or drag along the timeline to go back.`
-					: `All ${NL} layers: ${this.model.readerWeights} weights moved your ${this.wordCount} words, left to right. Drag to turn, scroll to come closer, or drag along the timeline to go back.`;
+					? `The whole journey: ${this.model.readerWeights} weights read your ${this.wordCount} words, ${this.model.painterWeights} painted them. Drag to turn, pinch or scroll to come closer, move it with two fingers (or a right-drag), or drag along the timeline to go back.`
+					: `All ${NL} layers: ${this.model.readerWeights} weights moved your ${this.wordCount} words, left to right. Drag to turn, pinch or scroll to come closer, move it with two fingers (or a right-drag), or drag along the timeline to go back.`;
 			else if ((this.mode === 'rewind' || this.mode === 'manual') && !inPainter)
 				caption = `Looking back at layer ${at} of ${NL}. Each jagged step is the sum of everything that layer added to the word.`;
 			else if (this.ride >= NL && this.ride - NL - HANDOFF < 0.5)
