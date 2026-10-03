@@ -321,10 +321,15 @@ export class BonsaiLLM {
 	};
 	n = 0;
 
+	/** Whether the per-layer buffers of the short pass are there (prefill and what reads it need them). */
+	readonly perLayer: boolean;
+
 	private constructor(
 		private device: GPUDevice,
-		gguf: GGUF
+		gguf: GGUF,
+		perLayer = true
 	) {
+		this.perLayer = perLayer;
 		const m = gguf.meta;
 		const arch = String(m['general.architecture']);
 		if (arch !== 'qwen3') throw new Error(`This runtime runs Qwen3 dense models, not ${arch}.`);
@@ -452,9 +457,9 @@ export class BonsaiLLM {
 		this.scales.unmap();
 		this.normw.unmap();
 
-		// ---- activations arena
+		// ---- activations arena (one layer's worth when only the long pass is wanted)
 		const N = MAX_TOKENS,
-			L = c.layers,
+			L = perLayer ? c.layers : 1,
 			D = c.dim,
 			F = c.ffn,
 			H = c.heads,
@@ -563,8 +568,9 @@ export class BonsaiLLM {
 	}
 
 	/** From a parsed GGUF already in memory (e.g. the reader part of the one-file model, see packed.ts). */
-	static fromGGUF(device: GPUDevice, gguf: GGUF): BonsaiLLM {
-		return new BonsaiLLM(device, gguf);
+	static fromGGUF(device: GPUDevice, gguf: GGUF, opts: { perLayer?: boolean } = {}): BonsaiLLM {
+		// perLayer false: only for the painter's conditioning (encodeLong), not for drawing every layer
+		return new BonsaiLLM(device, gguf, opts.perLayer ?? true);
 	}
 
 	/** GPU buffers holding every ternary weight (for drawing the real weights) and where a tensor lives in them. */
@@ -645,6 +651,8 @@ export class BonsaiLLM {
 			L = this.layout,
 			dev = this.device;
 		const n = ids.length;
+		if (!this.perLayer)
+			throw new Error('This reader was made for the long pass only (perLayer false).');
 		if (n < 1 || n > MAX_TOKENS)
 			throw new Error(`Prompts must be 1 to ${MAX_TOKENS} tokens long (this one is ${n}).`);
 		this.n = n;

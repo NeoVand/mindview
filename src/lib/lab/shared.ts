@@ -4,7 +4,8 @@ import { painterUrl, readerUrl } from '$lib/models';
 import { type GPU } from '$lib/engine/gpu';
 import { ensureFonts } from '$lib/engine/text';
 import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
-import { Painter, type PainterProgress } from '$lib/runtime/painter';
+import { LEAN, Painter, type PainterProgress } from '$lib/runtime/painter';
+import { lean } from './device';
 import { GpuScheduler } from '$lib/runtime/scheduler';
 import { PaintingRun, type RunOptions } from './painting-run';
 
@@ -26,11 +27,14 @@ function makeDevice(): Promise<GPUDevice> {
 		const requiredFeatures = (['timestamp-query', 'shader-f16'] as GPUFeatureName[]).filter((f) =>
 			adapter.features.has(f)
 		);
+		// in development, ?phone gives buffers no larger than a phone may allow (256 MB), to try the phone's path
+		const phone = import.meta.env.DEV && new URLSearchParams(location.search).has('phone');
+		const most = (n: number) => (phone ? Math.min(n, 256 << 20) : n);
 		const dev = await adapter.requestDevice({
 			requiredFeatures,
 			requiredLimits: {
-				maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-				maxBufferSize: adapter.limits.maxBufferSize,
+				maxStorageBufferBindingSize: most(adapter.limits.maxStorageBufferBindingSize),
+				maxBufferSize: most(adapter.limits.maxBufferSize),
 				// the default is 16 KB; the painter's GEMM tiles use up to 32 KB where the GPU has it
 				maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
 				maxStorageBuffersPerShaderStage: Math.min(
@@ -95,7 +99,12 @@ export async function labPainter(
 ): Promise<Painter> {
 	if (onProgress) painterListeners.add(onProgress);
 	try {
-		painter ??= Painter.load(dev, painterUrl(), (p) => painterListeners.forEach((l) => l(p))).catch(
+		painter ??= Painter.load(
+			dev,
+			painterUrl(),
+			(p) => painterListeners.forEach((l) => l(p)),
+			lean() ? LEAN : null
+		).catch(
 			(e) => {
 				painter = undefined;
 				throw e;

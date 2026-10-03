@@ -1,10 +1,19 @@
 // Whether this device can hold a page's models before it starts downloading them. A phone gives a web page far less
-// graphics memory than a computer (Safari on an iPhone reloads a tab at about 1.5 to 3 GB), and the labs keep about
-// 3 GB on the GPU, a live run of the landing or of Paint about 2.8 GB (measured in Chrome on a Mac, 2026-10-02).
+// graphics memory than a computer (Safari on an iPhone reloads a tab at about 1.5 to 3 GB). Measured in Chrome on a Mac
+// (2026-10-03): the labs keep about 3 GB on the GPU; a live run of the landing about 2.9 GB, Paint about 2.7 GB, and
+// with the painter held tightly as on a phone (Painter's lean mode) 2.1 and 2.0 GB, no buffer over 256 MB.
 
 export interface Fit {
 	ok: boolean;
 	why?: string; // what stands in the way, in a sentence
+}
+
+/**
+ * Whether to hold the models' memory tightly (Painter's lean mode): on a phone, and in development with ?phone (which
+ * also limits buffers as a phone may, see lab/shared.ts), to try the phone's path on a computer.
+ */
+export function lean(): boolean {
+	return phoneLike() || (import.meta.env.DEV && new URLSearchParams(location.search).has('phone'));
 }
 
 /** A phone (iPadOS calls itself a Mac and is not counted: iPads have more memory). */
@@ -29,10 +38,13 @@ export async function gpuFit(gigabytes: number, largest: number): Promise<Fit> {
 			ok: false,
 			why: `This graphics card lets a web page make blocks of memory of up to ${Math.floor(most / 2 ** 20)} MB; the models need one of ${largest} MB.`
 		};
-	if (phoneLike())
+	if (phoneLike() && !(import.meta.env.DEV && new URLSearchParams(location.search).has('phone')))
 		return {
 			ok: false,
-			why: `This needs about ${gigabytes} GB of graphics memory, and a phone gives a web page less than that: the tab would most likely reload part way.`
+			why:
+				gigabytes <= 2.5
+					? `This needs about ${gigabytes} GB of graphics memory, held as tightly as it can be on a phone. A recent phone with 8 GB of memory may manage it; on others the tab may reload part way.`
+					: `This needs about ${gigabytes} GB of graphics memory, and a phone gives a web page less than that: the tab would most likely reload part way.`
 		};
 	return { ok: true };
 }

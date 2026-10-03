@@ -160,7 +160,10 @@ export class PackedModel {
 		ts: GGUFTensor[],
 		each: (part: Map<string, Payload>) => void,
 		onProgress?: (fraction: number) => void,
-		chunk = 96 << 20
+		chunk = 96 << 20,
+		// only these tensors: parts with none of them are skipped, the others keep the same ranges (and so the same
+		// copies in the browser's cache)
+		want?: (t: GGUFTensor) => boolean
 	) {
 		const units: GGUFTensor[][] = [];
 		for (const t of ts) {
@@ -179,15 +182,20 @@ export class PackedModel {
 				group.push(...units[i]);
 				stop = end(units[i++]);
 			}
+			if (want && !group.some(want)) {
+				done += group.reduce((a, t) => a + this.bytes(t), 0);
+				continue;
+			}
 			const buf = await fetchModelRange(this.url, start, stop, this.tag, (f) =>
 				onProgress?.((done + f * (stop - start)) / total)
 			);
 			const part = new Map<string, Payload>();
 			for (const t of group)
-				part.set(
-					t.name,
-					await PackedModel.payload(t, new Uint8Array(buf, t.offset - start, this.bytes(t)))
-				);
+				if (!want || want(t))
+					part.set(
+						t.name,
+						await PackedModel.payload(t, new Uint8Array(buf, t.offset - start, this.bytes(t)))
+					);
 			each(part);
 			done += group.reduce((a, t) => a + this.bytes(t), 0);
 			onProgress?.(done / total);

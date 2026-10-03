@@ -67,8 +67,8 @@
 		canvas.addEventListener('pointermove', hover);
 		canvas.addEventListener('pointerleave', leave);
 		(async () => {
-			// the labs keep about 3 GB on the GPU: on a phone, ask first
-			await mayLoad(3, 890, (why, go) => (blocked = { why, go }));
+			// the labs keep about 3 GB on the GPU, the reader's per-layer states in one buffer of 521 MB: on a phone, ask first
+			await mayLoad(3, 521, (why, go) => (blocked = { why, go }));
 			blocked = null;
 			const gpu = await labGPU(canvas);
 			loading = 'Loading Ternary Bonsai 1.7B (460 MB, kept after the first time)';

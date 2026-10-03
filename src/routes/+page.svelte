@@ -137,8 +137,8 @@
 				return;
 			}
 			if (!live) {
-				// a live run keeps about 2.8 GB on the GPU: on a phone, ask first
-				await mayLoad(2.8, 890, (why, go) => (blocked = { why, go }));
+				// a live run keeps about 2.1 GB on a phone's GPU (2.9 on a computer's): on a phone, ask first
+				await mayLoad(2.1, 256, (why, go) => (blocked = { why, go }));
 				blocked = null;
 			}
 			const s = await piece();

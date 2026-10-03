@@ -275,8 +275,9 @@ export interface GemmJob {
 	M: number; // tokens
 	N: number; // outputs
 	K: number; // inputs (multiple of 128)
-	codes: number; // u32 offset of the weight codes
-	scales: number; // f32 offset of the weight scales
+	codes: number; // u32 offset of the weight codes (in their page)
+	scales: number; // f32 offset of the weight scales (in their page)
+	page?: number; // which page of the weights (see TernaryGemm), 0 unless they are split
 	x: number; // arena offset of X [M][K]
 	y: number; // arena offset of Y [M][N]
 	bias?: number; // arena offset of a bias [N]
@@ -298,13 +299,17 @@ export class TernaryGemm {
 	private lora: GPUBuffer;
 	private layout: GPUBindGroupLayout;
 	private params: GPUBuffer;
-	private bind: GPUBindGroup;
+	private binds: GPUBindGroup[];
 	private data: Uint32Array;
 
+	/**
+	 * codes and scales are one buffer each, or pages of them (where one buffer would be larger than the device lets a
+	 * buffer be): page i of the codes goes with page i of the scales, and a job names its page.
+	 */
 	constructor(
 		private device: GPUDevice,
-		codes: GPUBuffer,
-		scales: GPUBuffer,
+		codes: GPUBuffer | GPUBuffer[],
+		scales: GPUBuffer | GPUBuffer[],
 		arena: GPUBuffer,
 		private capacity = 1024,
 		fastBK: 0 | 16 | 32 = 16, // 0: the first kernel only
@@ -365,16 +370,20 @@ export class TernaryGemm {
 			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 		});
 		this.data = new Uint32Array(capacity * 64);
-		this.bind = device.createBindGroup({
-			layout: this.layout,
-			entries: [
-				{ binding: 0, resource: { buffer: this.params, size: 48 } },
-				{ binding: 1, resource: { buffer: codes } },
-				{ binding: 2, resource: { buffer: scales } },
-				{ binding: 3, resource: { buffer: arena } },
-				{ binding: 4, resource: { buffer: this.lora } }
-			]
-		});
+		const codePages = Array.isArray(codes) ? codes : [codes],
+			scalePages = Array.isArray(scales) ? scales : [scales];
+		this.binds = codePages.map((c, i) =>
+			device.createBindGroup({
+				layout: this.layout,
+				entries: [
+					{ binding: 0, resource: { buffer: this.params, size: 48 } },
+					{ binding: 1, resource: { buffer: c } },
+					{ binding: 2, resource: { buffer: scalePages[i] } },
+					{ binding: 3, resource: { buffer: arena } },
+					{ binding: 4, resource: { buffer: this.lora } }
+				]
+			})
+		);
 	}
 
 	/** Write the parameters of jobs[i] into slot (first + i); call before submitting the encoder that runs them. */
@@ -411,7 +420,7 @@ export class TernaryGemm {
 
 	/** Dispatch the job prepared in `slot`. */
 	dispatch(pass: GPUComputePassEncoder, slot: number, job: GemmJob) {
-		pass.setBindGroup(0, this.bind, [slot * 256]);
+		pass.setBindGroup(0, this.binds[job.page ?? 0], [slot * 256]);
 		if (this.fast && gemmFastOk(job)) {
 			pass.setPipeline(this.precision === 'f16' && this.fast16 ? this.fast16 : this.fast);
 			pass.dispatchWorkgroups(Math.ceil(job.N / FAST.BN), Math.ceil(job.M / FAST.BM));
@@ -423,5 +432,60 @@ export class TernaryGemm {
 			pass.setPipeline(this.pipe);
 			pass.dispatchWorkgroups(Math.ceil(job.N / GEMM_TILE.BN), Math.ceil(job.M / GEMM_TILE.BM));
 		}
+	}
+}
+
+/**
+ * Ternary weights split into pages no larger than the device lets one buffer be (a single page where everything
+ * fits): place() gives each tensor its page and its offsets there, buffers() makes the pages.
+ */
+export class WeightPages {
+	private used: { codes: number; scales: number }[] = [{ codes: 0, scales: 0 }];
+	constructor(private maxBytes: number) {}
+
+	/** The most a page may hold on this device (bytes). */
+	static limit(device: GPUDevice) {
+		return (
+			Math.floor(
+				Math.min(device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize) / 256
+			) * 256
+		);
+	}
+
+	/** Room for a tensor of n weights (16 codes per u32, one scale per 128). */
+	place(n: number): { page: number; codes: number; scales: number } {
+		const cw = n / 16,
+			sc = n / 128;
+		let u = this.used[this.used.length - 1];
+		if (
+			u.codes > 0 &&
+			((u.codes + cw) * 4 > this.maxBytes || (u.scales + sc) * 4 > this.maxBytes)
+		) {
+			u = { codes: 0, scales: 0 };
+			this.used.push(u);
+		}
+		const at = { page: this.used.length - 1, codes: u.codes, scales: u.scales };
+		u.codes += cw;
+		u.scales += sc;
+		return at;
+	}
+
+	buffers(device: GPUDevice, usage: GPUBufferUsageFlags, label: string) {
+		return {
+			codes: this.used.map((u, i) =>
+				device.createBuffer({
+					label: `${label} codes ${i}`,
+					size: Math.max(16, u.codes * 4),
+					usage
+				})
+			),
+			scales: this.used.map((u, i) =>
+				device.createBuffer({
+					label: `${label} scales ${i}`,
+					size: Math.max(16, u.scales * 4),
+					usage
+				})
+			)
+		};
 	}
 }

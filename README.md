@@ -171,9 +171,12 @@ You need:
 
 - A browser with WebGPU: a recent Chrome or Edge. It is developed and tested in Chrome on an Apple M4; Safari 26
   plays the recorded run.
-- A GPU with about 3 GB to spare: the labs keep about 3 GB on it, a live run of the landing or of `/paint` about
-  2.8 GB. A phone gives a web page less than that (Safari on an iPhone reloads a tab at about 1.5 to 3 GB), so on a
-  phone the recorded run plays and the live pages ask before they load.
+- A GPU with about 3 GB to spare: the labs keep about 3 GB on it, a live run of the landing about 2.9 GB, `/paint`
+  about 2.7 GB. A phone gives a web page less (Safari on an iPhone reloads a tab at about 1.5 to 3 GB), so on a phone
+  the painter holds its memory tightly, with the same arithmetic in smaller pieces: attention four heads at a time,
+  the largest projections 256 rows at a time, one side branch on the GPU (swapped from the browser's copy of the file
+  when the speed changes) and no buffer over 256 MB. That brings a live run to about 2.1 GB and `/paint` to 2.0 GB,
+  with the same pictures to the pixel. The recorded run plays anywhere; the live pages ask a phone before they load.
 - Room for the downloads on the first visit: 1.2 GB for a live run on the landing or for `/paint`, about 1.6 GB for
   the labs. The browser keeps them in Cache Storage for later visits.
 

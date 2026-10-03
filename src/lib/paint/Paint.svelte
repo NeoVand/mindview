@@ -14,10 +14,10 @@
 	import { packedUrl } from '$lib/models';
 	import { BonsaiLLM as Reader } from '$lib/runtime/bonsai-llm';
 	import { PackedModel } from '$lib/runtime/packed';
-	import { Painter as ThePainter } from '$lib/runtime/painter';
+	import { LEAN, Painter as ThePainter } from '$lib/runtime/painter';
 	import SiteHeader, { type NavLink } from '$lib/ui/SiteHeader.svelte';
 	import NeedsComputer from '$lib/ui/NeedsComputer.svelte';
-	import { mayLoad } from '$lib/lab/device';
+	import { lean, mayLoad } from '$lib/lab/device';
 	import Paintbrush from '@lucide/svelte/icons/paintbrush';
 	import Dices from '@lucide/svelte/icons/dices';
 	import Download from '@lucide/svelte/icons/download';
@@ -97,8 +97,19 @@
 				progress = got / total;
 				status = `Downloading the model: ${mb(got)} of ${mb(total)} MB. Your browser keeps it after the first time.`;
 			};
-			const llm = Reader.fromGGUF(dev, await packed.readerGGUF((f) => say(f * r)));
-			const painter = await ThePainter.fromPacked(dev, packed, (e) => say(r + e.fraction * p));
+			// the reader here only makes the painter's conditioning: no per-layer buffers (they are for drawing)
+			const llm = Reader.fromGGUF(dev, await packed.readerGGUF((f) => say(f * r)), {
+				perLayer: false
+			});
+			// on a phone, memory held tightly: one side branch at a time, swapped in when the speed changes
+			const painter = await ThePainter.fromPacked(
+				dev,
+				packed,
+				(e) => say(r + e.fraction * p),
+				null,
+				lean() ? LEAN : null,
+				'lora'
+			);
 			// the text stream cut to what the prompt needs (the rest is padding): the same pictures, a third less work
 			painter.textLength = 'auto';
 			return { llm, painter, megabytes: mb(total) };
@@ -113,8 +124,8 @@
 		canvas = c;
 		let alive = true;
 		(async () => {
-			// painting keeps about 2.8 GB on the GPU: on a phone, ask first
-			await mayLoad(2.8, 890, (why, go) => (blocked = { why, go }));
+			// painting keeps about 2 GB on a phone's GPU (2.7 on a computer's): on a phone, ask first
+			await mayLoad(2, 256, (why, go) => (blocked = { why, go }));
 			blocked = null;
 			device = await labDevice();
 			const { megabytes } = await load();
@@ -172,6 +183,8 @@
 			const schedule: Schedule =
 				instantAvailable && mode === 'instant' ? '1r' : fastAvailable && mode === 'fast' ? 2 : 4;
 			painter.setSteps(schedule);
+			status = 'Getting the speed ready';
+			await painter.prepare();
 			const steps = painter.steps;
 			// at 2 steps the pads matter more: keep 256 text rows (1 and 4 steps need only the prompt and a few)
 			painter.textLength = steps === 2 ? 256 : 'auto';

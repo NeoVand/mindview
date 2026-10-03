@@ -6,7 +6,8 @@ import { packedUrl, painterUrl, TURBO_REVISION } from '$lib/models';
 import { ensureFonts } from '$lib/engine/text';
 import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
 import { PackedModel } from '$lib/runtime/packed';
-import { Painter } from '$lib/runtime/painter';
+import { LEAN, Painter } from '$lib/runtime/painter';
+import { lean } from '$lib/lab/device';
 import type { ThreadsModel } from '$lib/viz/threads';
 
 export interface TurboProgress {
@@ -100,7 +101,10 @@ export async function turboPainter(
 							total
 						})
 					),
-				viz
+				viz,
+				// on a phone, memory held tightly (the landing paints Fast: its branch is the one on the GPU)
+				lean() ? LEAN : null,
+				'lora'
 			);
 		})().catch((e) => {
 			painter = undefined;

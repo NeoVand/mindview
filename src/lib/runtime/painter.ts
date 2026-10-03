@@ -11,7 +11,7 @@ import type { BonsaiLLM } from './bonsai-llm';
 import { fetchModelFile, fetchModelJson } from './cache';
 import { halfToFloat, unpackTrits, GGML_TRIT5, type GGUFTensor } from './gguf';
 import { PackedModel } from './packed';
-import { TernaryGemm, type GemmJob } from './gemm';
+import { TernaryGemm, WeightPages, type GemmJob } from './gemm';
 import { DenseGemm, denseOk, type DenseJob } from './dense';
 import { PainterFiles } from './painter-files';
 import { gemmMs, type GpuTask } from './scheduler';
@@ -172,14 +172,16 @@ fn upsample_sketch(@builtin(global_invocation_id) g: vec3u) {
 
 // How much each image patch attends to each prompt word (mean over heads) in the last attention.
 // a=image tokens, b=words, c=probabilities [heads][joint][joint], d=joint index of the first word, e=out [a][b],
-// f=joint index of the first image token, g=joint length, h=heads
+// f=joint index of the first image token, g=joint length, h=heads in c, i=heads in all (0: h), j=1 adds to out
+// (attention done a few heads at a time: each group adds its share of the mean)
 @compute @workgroup_size(64)
 fn attn_words(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x; let j = g.y;
   if (i >= U.a || j >= U.b) { return; }
   var s = 0.0;
   for (var hh = 0u; hh < U.h; hh++) { s += A[U.c + (hh * U.g + U.f + i) * U.g + U.d + j]; }
-  A[U.e + i * U.b + j] = s / f32(U.h);
+  let v = s / f32(select(U.h, U.i, U.i > 0u));
+  if (U.j == 1u) { A[U.e + i * U.b + j] += v; } else { A[U.e + i * U.b + j] = v; }
 }
 
 // For drawing the computation as threads: the mean of a block of rows (a = rows, b = width, c = rows, d = mean out)
@@ -235,6 +237,14 @@ fn copy_rows(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x + g.y * 65535u * 256u;
   if (i >= U.a) { return; }
   A[U.c + i] = A[U.b + i];
+}
+
+// Columns of a block of rows to another place: a=rows, b=width, c=src, d=src stride, e=dst, f=dst stride
+@compute @workgroup_size(256)
+fn copy_cols(@builtin(global_invocation_id) g: vec3u) {
+  let j = g.x; let r = g.y;
+  if (j >= U.b || r >= U.a) { return; }
+  A[U.e + r * U.f + j] = A[U.c + r * U.d + j];
 }
 
 @compute @workgroup_size(256)
@@ -310,7 +320,8 @@ type Kernel =
 	| 'row_mean'
 	| 'row_project'
 	| 'attn_pool'
-	| 'copy_rows';
+	| 'copy_rows'
+	| 'copy_cols';
 /** Seeded Gaussian noise (LCG + Box-Muller), as setNoise and upsampleLatent make it. */
 function gaussian(n: number, seed: number): Float32Array {
 	const z = new Float32Array(n);
@@ -349,6 +360,30 @@ export interface PainterLora {
 	ranks: Partial<Record<Branch, number>>;
 }
 type Branch = 'lora' | 'rdm' | 'best';
+/** Kernels (and dense GEMMs) one submission can hold: a whole step run at once (step), lean mode's included. */
+const SLOTS = 4096;
+
+/**
+ * How tightly the painter holds its memory, for a device that gives a page little of it (a phone, see
+ * lab/device.ts). The same arithmetic, in smaller pieces: attention a few heads at a time (its probabilities are
+ * heads x rows x rows), the largest projections a few rows at a time, fewer text rows, and one side branch on the GPU
+ * (the others are read again from the browser's copy of the file when a schedule needs them).
+ */
+export interface PainterLean {
+	heads: number;
+	rows: number;
+	text: number;
+}
+export const LEAN: PainterLean = { heads: 4, rows: 256, text: 256 };
+
+/** Where a ternary matrix lives: its shape, its page of the weights and its offsets there (u32 codes, f32 scales). */
+interface Ternary {
+	rows: number;
+	cols: number;
+	page: number;
+	codes: number;
+	scales: number;
+}
 /** A schedule: a step count, or '1r' (1 step with the `rdm` branch). */
 export type Schedule = number | '1r';
 
@@ -525,24 +560,29 @@ export class Painter {
 	lowTextRows = 128;
 	private pickRows(tokens: number) {
 		const want = this.textLength === 'auto' ? Math.ceil((tokens + 8) / 64) * 64 : this.textLength;
-		return Math.min(NT, Math.max(64, Math.ceil(want / 64) * 64));
+		return Math.min(this.ntMax, Math.max(64, Math.ceil(want / 64) * 64));
 	}
 	readonly arena: GPUBuffer;
 	private dense: GPUBuffer;
-	private codesBuf: GPUBuffer;
-	private scalesBuf: GPUBuffer;
+	private codePages: GPUBuffer[];
+	private scalePages: GPUBuffer[];
 	private gemm: TernaryGemm;
 	private dense16?: DenseGemm; // attention's matrix products in f16 (with precision 'f16')
 	private pipes: Record<Kernel, GPUComputePipeline>;
 	private bind: GPUBindGroup;
 	private params: GPUBuffer;
-	private tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
+	private tern = new Map<string, Ternary>();
 	private denseAt = new Map<string, number>();
 	readonly at: Record<string, number>;
 	sigmas: number[];
 	steps = 4;
 	/** A few-step LoRA as side branches of the DiT's ternary matrices (from the one-file model), and whether it is on. */
 	private lora?: PainterLora;
+	/** Memory kept tight (see PainterLean), or null. */
+	readonly lean: PainterLean | null;
+	private ntMax = NT; // the most text rows the arena holds
+	/** Side branches swapped in on demand (lean, from the one-file model): which is on the GPU, and how to read one. */
+	private swap?: { resident?: Branch; load: (b: Branch) => Promise<void> };
 	/** The ternary GEMMs' arithmetic: 'f16' (the default where the GPU has it: about 1.4x) or 'f32'. */
 	get precision() {
 		return this.gemm.precision;
@@ -574,19 +614,24 @@ export class Painter {
 	private constructor(
 		private device: GPUDevice,
 		files: PainterSource,
-		codes: GPUBuffer,
-		scales: GPUBuffer,
+		codes: GPUBuffer[],
+		scales: GPUBuffer[],
 		dense: GPUBuffer,
-		tern: Map<string, { rows: number; cols: number; codes: number; scales: number }>,
+		tern: Map<string, Ternary>,
 		denseAt: Map<string, number>,
 		probes: Map<string, Float32Array>, // colour probes for the decoder's stages (probe64, probe128, probe256)
-		lora?: PainterLora
+		lora?: PainterLora,
+		lean: PainterLean | null = null
 	) {
 		this.lora = lora;
+		this.lean = lean;
+		const ntMax = (this.ntMax = lean ? Math.min(NT, lean.text) : NT),
+			njMax = ntMax + NI;
+		const fused = denseAt.has('cond.weight') || tern.has('cond.weight');
 		this.manifest = files.manifest;
 		this.dense = dense;
-		this.codesBuf = codes;
-		this.scalesBuf = scales;
+		this.codePages = codes;
+		this.scalePages = scales;
 		this.tern = tern;
 		this.denseAt = denseAt;
 		this.sigmas = (files.manifest.schedule as { sigmas: number[] }).sigmas;
@@ -596,28 +641,28 @@ export class Painter {
 			['lat', NI * CIN],
 			['noise', NI * CIN],
 			['vel', NI * CIN],
-			['taps', NT * TAP],
-			['ctx', NT * CTX],
-			['ctxd', NT * D], // the text rows of the stream, as the fused map makes them (fused only)
-			['h', NJ * D],
-			['n1', NJ * D],
-			['q', NJ * D],
-			['k', NJ * D],
-			['v', NJ * D],
-			['o', NJ * D],
-			['p', NJ * (3 * D + 2 * MLP)],
-			['cat', NJ * (D + MLP)],
-			['s', H * NJ * NJ],
+			['taps', ntMax * TAP],
+			['ctx', fused ? 0 : ntMax * CTX], // the adapter's input (not used by the fused map)
+			['ctxd', ntMax * D], // the text rows of the stream, as the fused map makes them (fused only)
+			['h', njMax * D],
+			['n1', njMax * D],
+			['q', njMax * D],
+			['k', njMax * D],
+			['v', njMax * D],
+			['o', njMax * D],
+			['p', (lean ? lean.rows : njMax) * (3 * D + 2 * MLP)],
+			['cat', njMax * (D + MLP)],
+			['s', (lean ? lean.heads : H) * njMax * njMax],
 			['mod', 12 * 17 * D],
-			['lt', NJ * Math.max(0, ...Object.values(lora?.ranks ?? {}))], // a side branch's A x (see stepOps)
+			['lt', njMax * Math.max(0, ...Object.values(lora?.ranks ?? {}))], // a side branch's A x (see stepOps)
 			['abias', CTX],
 			['vl', NI * CIN],
 			['x0', 32 * 64 * 64],
 			['aw', NI * 128],
 			['awt', 128 * 128], // the prompt's words reading each other (joint attention, text rows)
 			['mu', 2 * D], // the mean image row and mean text row after a block
-			['proj', NJ * 4], // each row's projection on the drawing space (image rows, then text rows)
-			['pool', (NJ / POOL) ** 2] // a block's attention pooled (see attn_pool)
+			['proj', njMax * 4], // each row's projection on the drawing space (image rows, then text rows)
+			['pool', (njMax / POOL) ** 2] // a block's attention pooled (see attn_pool)
 		];
 		const at: Record<string, number> = {};
 		for (const [name, n] of regions) {
@@ -642,13 +687,13 @@ export class Painter {
 			row.set(mods[3].subarray(s * 2 * D, (s + 1) * 2 * D), 15 * D);
 			device.queue.writeBuffer(this.arena, (at.mod + s * 17 * D) * 4, row);
 		}
-		this.fused = denseAt.has('cond.weight') || tern.has('cond.weight');
+		this.fused = fused;
 		if (this.fused) {
 			// rows 0..2: the fixed prefix; rows 3..: the bias, to which the map adds each row's taps
-			const init = new Float32Array(NT * D);
+			const init = new Float32Array(ntMax * D);
 			init.set(files.dense('cond.prefix'), 0);
 			const bias = files.dense('cond.bias');
-			for (let r = 3; r < NT; r++) init.set(bias, r * D);
+			for (let r = 3; r < ntMax; r++) init.set(bias, r * D);
 			this.ctxInit = init;
 			// a ternary map adds its bias in the GEMM's epilogue
 			if (tern.has('cond.weight')) device.queue.writeBuffer(this.arena, at.abias * 4, bias);
@@ -659,7 +704,7 @@ export class Painter {
 
 		this.gemm = new TernaryGemm(device, codes, scales, this.arena, 1024, 16, lora?.buf);
 		this.dense16 = device.features.has('shader-f16')
-			? new DenseGemm(device, this.arena, 256)
+			? new DenseGemm(device, this.arena, SLOTS)
 			: undefined;
 		const module = device.createShaderModule({ label: 'painter', code: WGSL });
 		const layout = device.createBindGroupLayout({
@@ -688,7 +733,8 @@ export class Painter {
 			'row_mean',
 			'row_project',
 			'attn_pool',
-			'copy_rows'
+			'copy_rows',
+			'copy_cols'
 		];
 		this.pipes = Object.fromEntries(
 			names.map((e) => [
@@ -697,7 +743,7 @@ export class Painter {
 			])
 		) as Record<Kernel, GPUComputePipeline>;
 		this.params = device.createBuffer({
-			size: 1024 * 256,
+			size: SLOTS * 256,
 			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 		});
 		this.bind = device.createBindGroup({
@@ -717,25 +763,22 @@ export class Painter {
 	static async load(
 		device: GPUDevice,
 		base: string,
-		onProgress?: (p: PainterProgress) => void
+		onProgress?: (p: PainterProgress) => void,
+		lean: PainterLean | null = null
 	): Promise<Painter> {
 		const files = await PainterFiles.open(base);
 		const names = Object.keys(files.manifest.files as Record<string, unknown>);
 		const tensors = files.manifest.tensors;
-		// one codes buffer and one scales buffer for every ternary tensor (DiT and adapter)
-		const tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
-		let nc = 0,
-			ns = 0;
+		// the codes and scales of every ternary tensor (DiT and adapter), in as few pages as the device allows
+		const tern = new Map<string, Ternary>();
+		const pages = new WeightPages(WeightPages.limit(device));
 		for (const [k, e] of Object.entries(tensors)) {
 			if (e.kind !== 'ternary') continue;
-			tern.set(k, { rows: e.shape[0], cols: e.shape[1], codes: nc, scales: ns });
-			nc += e.codes.bytes / 4;
-			ns += e.scales.bytes / 4;
+			tern.set(k, { rows: e.shape[0], cols: e.shape[1], ...pages.place(e.shape[0] * e.shape[1]) });
 		}
 		// (copyable, so a lab can read back one weight exactly)
 		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-		const codes = device.createBuffer({ label: 'painter codes', size: nc * 4, usage });
-		const scales = device.createBuffer({ label: 'painter scales', size: ns * 4, usage });
+		const { codes, scales } = pages.buffers(device, usage, 'painter');
 		// dense weights the DiT reads: embedders, projection out, QK gains, rope tables
 		const denseNames = Object.keys(tensors).filter(
 			(k) =>
@@ -782,8 +825,8 @@ export class Painter {
 				if (e.kind === 'ternary') {
 					const t = files.ternary(k),
 						where = tern.get(k)!;
-					device.queue.writeBuffer(codes, where.codes * 4, t.codes);
-					device.queue.writeBuffer(scales, where.scales * 4, t.scales);
+					device.queue.writeBuffer(codes[where.page], where.codes * 4, t.codes);
+					device.queue.writeBuffer(scales[where.page], where.scales * 4, t.scales);
 				} else if (denseAt.has(k)) {
 					device.queue.writeBuffer(dense, denseAt.get(k)! * 4, files.dense(k));
 					if (k === 'rope.cos' || k === 'rope.sin')
@@ -793,7 +836,18 @@ export class Painter {
 			if (n.startsWith('dit_') && n !== 'dit_misc.bin') files.release(n);
 		}
 		onProgress?.({ stage: 'Ready', fraction: 1 });
-		const painter = new Painter(device, files, codes, scales, dense, tern, denseAt, probes);
+		const painter = new Painter(
+			device,
+			files,
+			codes,
+			scales,
+			dense,
+			tern,
+			denseAt,
+			probes,
+			undefined,
+			lean
+		);
 		// other step counts (optional): sigmas and modulation per step, see export_painter_schedules.py
 		const sj = await fetchModelJson<
 			Record<string, Record<string, { sigmas: number[]; offset: number }>>
@@ -869,7 +923,9 @@ export class Painter {
 		device: GPUDevice,
 		model: PackedModel,
 		onProgress?: (p: PainterProgress) => void,
-		viz?: PainterViz | null // the readouts for the visuals (the one-file model has only the decoder's stage probes)
+		viz?: PainterViz | null, // the readouts for the visuals (the one-file model has only the decoder's stage probes)
+		lean: PainterLean | null = null,
+		first: Branch = 'lora' // lean: the side branch on the GPU to begin with (useBranch swaps it)
 	): Promise<Painter> {
 		const ts = model.tensors('painter');
 		// a ternary tensor is the one with a `.scale` beside it (its stored type may be a deflate wrapper)
@@ -884,7 +940,7 @@ export class Painter {
 			k === 'temb' ||
 			k.startsWith('cond.b') ||
 			k === 'cond.prefix';
-		const tern = new Map<string, { rows: number; cols: number; codes: number; scales: number }>();
+		const tern = new Map<string, Ternary>();
 		const denseAt = new Map<string, number>();
 		const loraAt = new Map<string, number>(); // the side branches' B (transposed), in a buffer of their own
 		// the GEMM's side branch runs in chunks of 32: a lower rank is padded with zero rows (buffers start zeroed)
@@ -900,23 +956,34 @@ export class Painter {
 			const b = name.slice(0, name.indexOf('.')) as Branch;
 			return stored[b] ? b : undefined;
 		};
-		let nc = 0,
-			ns = 0,
-			nd = 0,
+		const pages = new WeightPages(WeightPages.limit(device));
+		// lean: every branch's A and B for one module share one place (one branch is on the GPU at a time), as large as
+		// the largest rank needs
+		const most = Math.max(0, ...Object.values(ranks));
+		const shared = new Map<string, number>();
+		const room = new Map<string, number>(); // lean: each branch tensor's place, in floats
+		let nd = 0,
 			nl = 0;
 		for (const t of ts) {
 			const b = branchOf(t.name);
-			if (b && t.name.endsWith('.bt')) {
-				loraAt.set(t.name, nl);
-				nl += Math.ceil(((PackedModel.count(t) / stored[b]!) * ranks[b]!) / 4) * 4;
-			} else if (b && t.name.endsWith('.a')) {
-				denseAt.set(t.name, nd);
-				nd += Math.ceil(((PackedModel.count(t) / stored[b]!) * ranks[b]!) / 4) * 4;
+			const isB = !!b && t.name.endsWith('.bt'),
+				isA = !!b && t.name.endsWith('.a');
+			if (isA || isB) {
+				const rank = lean ? most : ranks[b!]!;
+				const size = Math.ceil(((PackedModel.count(t) / stored[b!]!) * rank) / 4) * 4;
+				const key = t.name.slice(b!.length + 1);
+				room.set(t.name, size);
+				let at = lean ? shared.get(key) : undefined;
+				if (at === undefined) {
+					at = isB ? nl : nd;
+					if (isB) nl += size;
+					else nd += size;
+					if (lean) shared.set(key, at);
+				}
+				(isB ? loraAt : denseAt).set(t.name, at);
 			} else if (isTernary(t)) {
 				const [K, M] = t.dims;
-				tern.set(t.name, { rows: M, cols: K, codes: nc, scales: ns });
-				nc += (M * K) / 16;
-				ns += (M * K) / 128;
+				tern.set(t.name, { rows: M, cols: K, ...pages.place(M * K) });
 			} else if (!isScale(t) && !onCpu(t.name)) {
 				denseAt.set(t.name, nd);
 				nd += PackedModel.count(t);
@@ -928,8 +995,7 @@ export class Painter {
 		}
 		if (viz) nd = Painter.placeViz(viz, denseAt, nd, false);
 		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-		const codes = device.createBuffer({ label: 'painter codes', size: nc * 4, usage });
-		const scales = device.createBuffer({ label: 'painter scales', size: ns * 4, usage });
+		const { codes, scales } = pages.buffers(device, usage, 'painter');
 		const dense = device.createBuffer({ label: 'painter dense', size: nd * 4, usage });
 		const probes = new Map<string, Float32Array>();
 		if (viz) Painter.writeViz(device, viz, dense, denseAt, probes);
@@ -937,21 +1003,37 @@ export class Painter {
 			? device.createBuffer({ label: 'painter lora', size: nl * 4, usage })
 			: undefined;
 		const kept = new Map<string, Float32Array>();
+		// a side branch's A and B onto the GPU (lean: over another branch's, so the padding rows are written as zeros)
+		const putBranch = (name: string, p: Parameters<typeof PackedModel.floats>[0]) => {
+			let v = PackedModel.floats(p, name);
+			if (lean) {
+				const full = new Float32Array(room.get(name)!);
+				full.set(v);
+				v = full;
+			}
+			if (loraAt.has(name)) device.queue.writeBuffer(loraBuf!, loraAt.get(name)! * 4, v);
+			else device.queue.writeBuffer(dense, denseAt.get(name)! * 4, v);
+		};
 		await model.read(
 			ts,
 			(part) => {
 				for (const [name, p] of part) {
 					const t = model.tensor(name)!;
-					if (p.type === GGML_TRIT5) {
+					const b = branchOf(name);
+					if (b && (name.endsWith('.a') || name.endsWith('.bt'))) {
+						if (!lean || b === first) putBranch(name, p);
+					} else if (p.type === GGML_TRIT5) {
 						const where = tern.get(name)!;
 						const n = where.rows * where.cols;
 						const words = new Uint32Array(n / 16);
 						unpackTrits(p.data, n, words, 0);
-						device.queue.writeBuffer(codes, where.codes * 4, words);
+						device.queue.writeBuffer(codes[where.page], where.codes * 4, words);
 						const sc = part.get(name + '.scale')!;
-						device.queue.writeBuffer(scales, where.scales * 4, PackedModel.floats(sc, name));
-					} else if (loraAt.has(name)) {
-						device.queue.writeBuffer(loraBuf!, loraAt.get(name)! * 4, PackedModel.floats(p, name));
+						device.queue.writeBuffer(
+							scales[where.page],
+							where.scales * 4,
+							PackedModel.floats(sc, name)
+						);
 					} else if (!isScale(t)) {
 						const v = PackedModel.floats(p, name);
 						if (onCpu(name)) kept.set(name, v);
@@ -982,8 +1064,26 @@ export class Painter {
 			tern,
 			denseAt,
 			probes,
-			loraBuf ? { buf: loraBuf, at: loraAt, ranks } : undefined
+			loraBuf ? { buf: loraBuf, at: loraAt, ranks } : undefined,
+			lean
 		);
+		if (lean && loraBuf)
+			painter.swap = {
+				resident: first,
+				// read the branch's tensors again from the browser's copy of the file (the same ranges as above)
+				load: (b) =>
+					model.read(
+						ts,
+						(part) => {
+							for (const [name, p] of part)
+								if (branchOf(name) === b && (name.endsWith('.a') || name.endsWith('.bt')))
+									putBranch(name, p);
+						},
+						undefined,
+						undefined,
+						(t) => branchOf(t.name) === b
+					)
+			};
 		// other step counts (sigmas and modulation per step), when the file carries them
 		const sched = model.meta['mindview.schedules'];
 		if (sched && kept.has('sched.mod'))
@@ -1005,7 +1105,7 @@ export class Painter {
 
 	/** Free the painter's GPU memory (it cannot be used afterwards). */
 	destroy() {
-		for (const b of [this.arena, this.codesBuf, this.scalesBuf, this.dense, this.params])
+		for (const b of [this.arena, ...this.codePages, ...this.scalePages, this.dense, this.params])
 			b.destroy();
 		this.lora?.buf.destroy();
 	}
@@ -1146,11 +1246,22 @@ export class Painter {
 	}
 
 	/** The ops of one step and where its blocks end: [op index after which, block] (-1 embedded, 25 done). */
-	private stepOps(s: number, tap?: Tap, pool?: (b: number, ops: Op[]) => void) {
+	private stepOps(
+		s: number,
+		tap?: Tap,
+		pool?: (b: number, ops: Op[]) => void,
+		words?: { first: number; count: number } // lean: where the readouts' word attention comes from (see attention)
+	) {
 		const at = this.at,
 			mod = at.mod + s * 17 * D,
 			// a first step at 256 x 256 reads a prefix of the text rows (the reader is causal: the same rows)
 			{ ni, nt, nj } = this.dims(s);
+		// lean: attention a few heads at a time, the largest projections a few rows at a time (taps and pools read
+		// whole intermediate states, which lean mode does not keep)
+		const lean = this.lean;
+		if (lean && (tap || pool))
+			throw new Error('This device keeps the painter lean: it cannot be taken apart.');
+		const R = lean?.rows ?? 0;
 		// image rows turn by the rope table's rows for (h, w): the full table's 512.. at 32 x 32, a 16 x 16 copy at 256
 		const ropeImg: [string, string, number] =
 			ni === NI ? ['rope.cos', 'rope.sin', ROPE_IMG] : ['rope.cos16', 'rope.sin16', 0];
@@ -1182,7 +1293,18 @@ export class Painter {
 			}
 			ops.push({
 				k: 'gemm',
-				job: { M, N: t.rows, K: t.cols, codes: t.codes, scales: t.scales, x, y, ...extra, lora }
+				job: {
+					M,
+					N: t.rows,
+					K: t.cols,
+					page: t.page,
+					codes: t.codes,
+					scales: t.scales,
+					x,
+					y,
+					...extra,
+					lora
+				}
 			});
 		};
 		const modulate = (rows: number, x: number, y: number, shift: number, scale: number) =>
@@ -1203,59 +1325,78 @@ export class Painter {
 				[1e-6]
 			);
 		const attention = (v: number, vStride: number, out: number, outStride: number) => {
-			const qk: DenseJob = {
-				M: nj,
-				N: nj,
-				K: HD,
-				a: at.q,
-				lda: D,
-				sa: HD,
-				b: at.k,
-				ldb: D,
-				sb: HD,
-				c: at.s,
-				ldc: nj,
-				sc: nj * nj,
-				batch: H,
-				nn: false,
-				scale: 1 / Math.sqrt(HD)
-			};
-			const pv: DenseJob = {
-				M: nj,
-				N: HD,
-				K: nj,
-				a: at.s,
-				lda: nj,
-				sa: nj * nj,
-				b: v,
-				ldb: vStride,
-				sb: HD,
-				c: out,
-				ldc: outStride,
-				sc: HD,
-				batch: H,
-				nn: true,
-				scale: 1
-			};
-			if (this.dense16 && this.gemm.precision === 'f16' && denseOk(qk) && denseOk(pv)) {
-				ops.push({ k: 'dense', job: qk });
-				K('softmax', [H * nj, nj, at.s], [Math.min(H * nj, 65535), Math.ceil((H * nj) / 65535), 1]);
-				ops.push({ k: 'dense', job: pv });
-				return;
+			const group = lean ? lean.heads : H;
+			for (let h0 = 0; h0 < H; h0 += group) {
+				const n = Math.min(group, H - h0);
+				const qk: DenseJob = {
+					M: nj,
+					N: nj,
+					K: HD,
+					a: at.q + h0 * HD,
+					lda: D,
+					sa: HD,
+					b: at.k + h0 * HD,
+					ldb: D,
+					sb: HD,
+					c: at.s,
+					ldc: nj,
+					sc: nj * nj,
+					batch: n,
+					nn: false,
+					scale: 1 / Math.sqrt(HD)
+				};
+				const pv: DenseJob = {
+					M: nj,
+					N: HD,
+					K: nj,
+					a: at.s,
+					lda: nj,
+					sa: nj * nj,
+					b: v + h0 * HD,
+					ldb: vStride,
+					sb: HD,
+					c: out + h0 * HD,
+					ldc: outStride,
+					sc: HD,
+					batch: n,
+					nn: true,
+					scale: 1
+				};
+				const dense = this.dense16 && this.gemm.precision === 'f16' && denseOk(qk) && denseOk(pv);
+				if (dense) ops.push({ k: 'dense', job: qk });
+				else
+					K(
+						'dgemm',
+						[nj, nj, HD, qk.a, D, HD, qk.b, D, HD, at.s, nj, nj * nj, 0],
+						[nj / 64, nj / 64, n],
+						[1 / Math.sqrt(HD)]
+					);
+				K('softmax', [n * nj, nj, at.s], [Math.min(n * nj, 65535), Math.ceil((n * nj) / 65535), 1]);
+				// lean: the probabilities are gone once the next heads come, so the readouts' word attention is taken
+				// here, each group adding its share of the mean over all heads
+				if (lean && words) {
+					const add = h0 > 0 ? 1 : 0;
+					K(
+						'attn_words',
+						[ni, words.count, at.s, words.first, at.aw, nt, nj, n, H, add],
+						[ni / 64, words.count, 1]
+					);
+					const nW = Math.min(words.count, 128);
+					K(
+						'attn_words',
+						[nW, nW, at.s, words.first, at.awt, words.first, nj, n, H, add],
+						[Math.ceil(nW / 64), nW, 1]
+					);
+				}
+				if (dense) ops.push({ k: 'dense', job: pv });
+				else
+					K(
+						'dgemm',
+						[nj, HD, nj, at.s, nj, nj * nj, pv.b, vStride, HD, pv.c, outStride, HD, 2],
+						[HD / 64, nj / 64, n],
+						[1]
+					);
 			}
-			K(
-				'dgemm',
-				[nj, nj, HD, at.q, D, HD, at.k, D, HD, at.s, nj, nj * nj, 0],
-				[nj / 64, nj / 64, H],
-				[1 / Math.sqrt(HD)]
-			);
-			K('softmax', [H * nj, nj, at.s], [Math.min(H * nj, 65535), Math.ceil((H * nj) / 65535), 1]);
-			K(
-				'dgemm',
-				[nj, HD, nj, at.s, nj, nj * nj, v, vStride, HD, out, outStride, HD, 2],
-				[HD / 64, nj / 64, H],
-				[1]
-			);
 		};
 
 		const hooks: [number, number][] = []; // [op index after which, block] (-1 = embedded, 25 = step done)
@@ -1338,16 +1479,34 @@ export class Painter {
 			modulate(ni, at.h + I0, at.n1 + I0, MI(3), MI(4));
 			modulate(nt, at.h + T0, at.n1 + T0, MT(3), MT(4));
 			T('n2', at.n1, D, 0, 'all', b);
-			G(P + 'ff.linear_in.weight', ni, at.n1 + I0, at.p);
-			T('p', at.p, 2 * MLP, nt, 'img', b);
-			K('swiglu', [ni, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, ni, 1]);
-			T('cat', at.cat, MLP, nt, 'img', b);
-			G(P + 'ff.linear_out.weight', ni, at.cat, at.h + I0, { bias: MI(5), gated: true });
-			G(P + 'ff_context.linear_in.weight', nt, at.n1 + T0, at.p);
-			T('p', at.p, 2 * MLP, 0, 'txt', b);
-			K('swiglu', [nt, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, nt, 1]);
-			T('cat', at.cat, MLP, 0, 'txt', b);
-			G(P + 'ff_context.linear_out.weight', nt, at.cat, at.h + T0, { bias: MT(5), gated: true });
+			if (R) {
+				// lean: the MLP's input projection and SwiGLU a few rows at a time
+				const mlp = (w: string, rows: number, x: number) => {
+					for (let r0 = 0; r0 < rows; r0 += R) {
+						const n = Math.min(R, rows - r0);
+						G(w, n, x + r0 * D, at.p);
+						K('swiglu', [n, MLP, at.p, 2 * MLP, at.cat + r0 * MLP, MLP], [MLP / 256, n, 1]);
+					}
+				};
+				mlp(P + 'ff.linear_in.weight', ni, at.n1 + I0);
+				G(P + 'ff.linear_out.weight', ni, at.cat, at.h + I0, { bias: MI(5), gated: true });
+				mlp(P + 'ff_context.linear_in.weight', nt, at.n1 + T0);
+				G(P + 'ff_context.linear_out.weight', nt, at.cat, at.h + T0, { bias: MT(5), gated: true });
+			} else {
+				G(P + 'ff.linear_in.weight', ni, at.n1 + I0, at.p);
+				T('p', at.p, 2 * MLP, nt, 'img', b);
+				K('swiglu', [ni, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, ni, 1]);
+				T('cat', at.cat, MLP, nt, 'img', b);
+				G(P + 'ff.linear_out.weight', ni, at.cat, at.h + I0, { bias: MI(5), gated: true });
+				G(P + 'ff_context.linear_in.weight', nt, at.n1 + T0, at.p);
+				T('p', at.p, 2 * MLP, 0, 'txt', b);
+				K('swiglu', [nt, MLP, at.p, 2 * MLP, at.cat, MLP], [MLP / 256, nt, 1]);
+				T('cat', at.cat, MLP, 0, 'txt', b);
+				G(P + 'ff_context.linear_out.weight', nt, at.cat, at.h + T0, {
+					bias: MT(5),
+					gated: true
+				});
+			}
 			T('h_out', at.h, D, 0, 'all', b);
 			hooks.push([ops.length, b]);
 		}
@@ -1359,6 +1518,49 @@ export class Painter {
 			T('h_in', at.h, D, 0, 'all', bb);
 			modulate(nj, at.h, at.n1, MS(0), MS(1));
 			T('n1', at.n1, D, 0, 'all', bb);
+			if (R) {
+				// lean: the fused projection a few rows at a time, each chunk's q and k (normed and turned), v and the
+				// MLP's SwiGLU taken out of it before the next; then attention and the output projection as usual
+				for (let r0 = 0; r0 < nj; r0 += R) {
+					const n = Math.min(R, nj - r0);
+					G(P + 'attn.to_qkv_mlp_proj.weight', n, at.n1 + r0 * D, at.p);
+					if (r0 < nt) {
+						const m = Math.min(nt, r0 + n) - r0;
+						qk(m, at.p, PW, at.q + r0 * D, P + 'attn.norm_q.weight', r0);
+						qk(m, at.p + D, PW, at.k + r0 * D, P + 'attn.norm_k.weight', r0);
+					}
+					if (r0 + n > nt) {
+						const i0 = Math.max(0, r0 - nt), // the chunk's first image row
+							from = (nt + i0 - r0) * PW,
+							m = r0 + n - (nt + i0);
+						const rope: [string, string] = [ropeImg[0], ropeImg[1]];
+						qk(
+							m,
+							at.p + from,
+							PW,
+							at.q + (nt + i0) * D,
+							P + 'attn.norm_q.weight',
+							ropeImg[2] + i0,
+							rope
+						);
+						qk(
+							m,
+							at.p + D + from,
+							PW,
+							at.k + (nt + i0) * D,
+							P + 'attn.norm_k.weight',
+							ropeImg[2] + i0,
+							rope
+						);
+					}
+					K('copy_cols', [n, D, at.p + 2 * D, PW, at.v + r0 * D, D], [D / 256, n, 1]);
+					K('swiglu', [n, MLP, at.p + 3 * D, PW, at.cat + r0 * CW + D, CW], [MLP / 256, n, 1]);
+				}
+				attention(at.v, D, at.cat, CW);
+				G(P + 'attn.to_out.weight', nj, at.cat, at.h, { bias: MS(2), gated: true });
+				hooks.push([ops.length, bb]);
+				continue;
+			}
 			G(P + 'attn.to_qkv_mlp_proj.weight', nj, at.n1, at.p);
 			T('p', at.p, PW, 0, 'all', bb);
 			// text rows turn by rope rows 0.., image rows by rope rows 512.. (whatever the text length)
@@ -1620,7 +1822,7 @@ export class Painter {
 		onPicture?: (enc: GPUCommandEncoder, b: number) => void,
 		onInput?: (space: BlockSpace) => void
 	): GpuTask[] {
-		const { ops, hooks } = this.stepOps(s);
+		const { ops, hooks } = this.stepOps(s, undefined, undefined, words);
 		const tasks: GpuTask[] = [];
 		const lens = this.hasLens && this.taef2.hasEarly;
 		let from = 0;
@@ -1821,20 +2023,23 @@ export class Painter {
 				wg: [(ni * CIN) / 256, 1, 1]
 			});
 		}
-		ops.push({
-			k: 'kernel',
-			name: 'attn_words',
-			p: [ni, count, at.s, words.first, at.aw, ntj, nj, H],
-			wg: [ni / 64, count, 1]
-		});
-		// and how the words read each other in this block: [word][word], averaged over the heads
+		// (lean: the step's own ops took both, a few heads at a time, see stepOps)
 		const nW = Math.min(count, 128);
-		ops.push({
-			k: 'kernel',
-			name: 'attn_words',
-			p: [nW, nW, at.s, words.first, at.awt, words.first, nj, H],
-			wg: [Math.ceil(nW / 64), nW, 1]
-		});
+		if (!this.lean) {
+			ops.push({
+				k: 'kernel',
+				name: 'attn_words',
+				p: [ni, count, at.s, words.first, at.aw, ntj, nj, H],
+				wg: [ni / 64, count, 1]
+			});
+			// and how the words read each other in this block: [word][word], averaged over the heads
+			ops.push({
+				k: 'kernel',
+				name: 'attn_words',
+				p: [nW, nW, at.s, words.first, at.awt, words.first, nj, H],
+				wg: [Math.ceil(nW / 64), nW, 1]
+			});
+		}
 		let out: GPUBuffer;
 		// read back: attention [NI][count], then (with the space) projections [NI + nt][4], then the quick picture
 		// as rgba floats [64 * 64][4] (the patches' colours)
@@ -2007,9 +2212,12 @@ export class Painter {
 
 	/** The painter's weights (for drawing them): the ternary codes and scales, the dense weights, and where each is. */
 	get weights() {
+		// the labs draw from these as one buffer each: right only where the weights are one page (every computer; a
+		// phone may split them, see WeightPages)
 		return {
-			codes: this.codesBuf,
-			scales: this.scalesBuf,
+			codes: this.codePages[0],
+			scales: this.scalePages[0],
+			pages: this.codePages.length,
 			dense: this.dense,
 			ternary: (name: string) => this.t(name),
 			dense_at: (name: string) => this.w(name),
@@ -2027,14 +2235,14 @@ export class Painter {
 		});
 		const enc = dev.createCommandEncoder();
 		enc.copyBufferToBuffer(
-			this.codesBuf,
+			this.codePages[t.page],
 			(t.codes + row * (t.cols / 16) + Math.floor(col / 16)) * 4,
 			buf,
 			0,
 			4
 		);
 		enc.copyBufferToBuffer(
-			this.scalesBuf,
+			this.scalePages[t.page],
 			(t.scales + row * (t.cols / 128) + Math.floor(col / 128)) * 4,
 			buf,
 			4,
@@ -2047,11 +2255,12 @@ export class Painter {
 		return { code: ((u[0] >>> ((col % 16) * 2)) & 3) - 1, scale: new Float32Array(u.buffer)[1] };
 	}
 
-	/** Floats read back from the painter's activations (its arena), its dense weights or its ternary scales. */
+	/** Floats read back from the painter's activations (its arena), its dense weights or its ternary scales (of a page). */
 	async readFloats(
 		from: 'arena' | 'dense' | 'scales',
 		offset: number,
-		count: number
+		count: number,
+		page = 0
 	): Promise<Float32Array> {
 		const dev = this.device;
 		const buf = dev.createBuffer({
@@ -2059,7 +2268,8 @@ export class Painter {
 			usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
 		});
 		const enc = dev.createCommandEncoder();
-		const src = from === 'arena' ? this.arena : from === 'dense' ? this.dense : this.scalesBuf;
+		const src =
+			from === 'arena' ? this.arena : from === 'dense' ? this.dense : this.scalePages[page];
 		enc.copyBufferToBuffer(src, offset * 4, buf, 0, count * 4);
 		dev.queue.submit([enc.finish()]);
 		await buf.mapAsync(GPUMapMode.READ);
@@ -2192,7 +2402,7 @@ export class Painter {
 		});
 		const jobs = ops.flatMap((o) => (o.k === 'gemm' ? [o.job] : []));
 		const djobs = ops.flatMap((o) => (o.k === 'dense' ? [o.job] : []));
-		if (k0 + kernels.length > 1024 || g0 + jobs.length > 1024)
+		if (k0 + kernels.length > SLOTS || g0 + jobs.length > 1024)
 			throw new Error('Too much painter work in one submission.');
 		if (kernels.length) dev.queue.writeBuffer(this.params, k0 * 256, data);
 		if (jobs.length) this.gemm.prepare(jobs, g0);
@@ -2248,6 +2458,18 @@ export class Painter {
 	 * Use a schedule (sigmas and the per-step modulation): n steps, with the few-step LoRA at 1 or 2 when the file has
 	 * it, or '1r': 1 step with EPFL's 1-step fine-tune.
 	 */
+	/**
+	 * Make sure the side branch the schedule uses is on the GPU (lean: one at a time, read again from the browser's
+	 * copy of the file when it changes; a second or two). Call after setSteps and before painting.
+	 */
+	async prepare() {
+		const b = this.branch;
+		if (!b || !this.swap || this.swap.resident === b) return;
+		this.swap.resident = undefined;
+		await this.swap.load(b);
+		this.swap.resident = b;
+	}
+
 	setSteps(n: Schedule) {
 		const sc = this.schedules?.meta[String(n)];
 		if (n === '1r' && !this.hasOneStep) throw new Error('The painter has no 1-step fine-tune.');
