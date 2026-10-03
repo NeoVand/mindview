@@ -115,16 +115,24 @@ fn swiglu(@builtin(global_invocation_id) g: vec3u) {
   A[U.e + r * U.f + j] = x / (1.0 + exp(-x)) * A[U.c + r * U.d + U.b + j];
 }
 
-// The painting this block has in mind: x0 = x_t - sigma * v_lens, written in TAEF2's layout [32][64][64].
-// a=values (1024 * 128), b=v_lens [1024][128] (no bias), c=lens bias (WD), d=lat, e=x0 out, fa=sigma
+// The painting this block has in mind: x0 = x_t - sigma * v_lens, written in TAEF2's layout [32][64][64]. A coarse
+// step's G x G patches (G = 16) fill the same layout, each latent pixel repeated over the 2 x 2 it covers at full size.
+// a=values (G * G * 128), b=v_lens [G * G][128] (no bias), c=lens bias (WD), d=lat, e=x0 out, f=G (0: 32), fa=sigma
 @compute @workgroup_size(256)
 fn lens_x0(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= U.a) { return; }
+  let G = select(32u, U.f, U.f > 0u);
+  let r = 32u / G;
   let t = i / 128u; let ch = i % 128u;
-  let h = t / 32u; let w = t % 32u;
+  let h = t / G; let w = t % G;
   let c = ch / 4u; let dy = (ch % 4u) / 2u; let dx = ch % 2u;
-  A[U.e + (c * 64u + 2u * h + dy) * 64u + 2u * w + dx] = A[U.d + i] - U.fa * (A[U.b + i] + WD[U.c + ch]);
+  let v = A[U.d + i] - U.fa * (A[U.b + i] + WD[U.c + ch]);
+  for (var yy = 0u; yy < r; yy++) {
+    for (var xx = 0u; xx < r; xx++) {
+      A[U.e + (c * 64u + (2u * h + dy) * r + yy) * 64u + (2u * w + dx) * r + xx] = v;
+    }
+  }
 }
 
 // After a step: its clean guess x0 = lat - sigma' v (lat already moved on to sigma'), unpatchified into TAEF2's layout
@@ -477,6 +485,16 @@ export interface BlockSpace {
 	colours: Float32Array | null;
 }
 
+/** The visuals' readouts (export_painter_viz2.py): the tuned lens, the latent colour probe, the decoder's stage
+ * probes and the drawing spaces, indexed by viz.json into viz.bin. */
+export interface PainterViz {
+	json: Record<
+		'lens' | 'probe' | 'probe64' | 'probe128' | 'probe256' | 'space_img' | 'space_txt',
+		{ shape: number[]; offset: number; bytes: number }
+	>;
+	bin: ArrayBuffer;
+}
+
 export class Painter {
 	readonly taef2: Taef2;
 	/** Real (unpadded) rows of the prompt the painter last read. */
@@ -738,47 +756,11 @@ export class Painter {
 			nd += 256 * 64;
 		}
 		// optional readouts for the visuals: the tuned lens and the latent colour probe (viz.json / viz.bin)
-		const viz = await fetchModelJson<
-			Record<
-				'lens' | 'probe' | 'probe64' | 'probe128' | 'probe256' | 'space_img' | 'space_txt',
-				{ shape: number[]; offset: number; bytes: number }
-			>
-		>(`${base}/viz.json`).catch(() => null);
-		if (viz) {
-			denseAt.set('viz.lens', nd);
-			nd += viz.lens.shape.reduce((a, b) => a * b, 1);
-			denseAt.set('viz.probe', nd);
-			nd += 99;
-			for (const k of ['space_img', 'space_txt'] as const)
-				if (viz[k]) {
-					denseAt.set(`viz.${k}`, nd);
-					nd += 3 * D;
-				}
-		}
+		const viz = await Painter.loadViz(base);
+		if (viz) nd = Painter.placeViz(viz, denseAt, nd, true);
 		const dense = device.createBuffer({ label: 'painter dense', size: nd * 4, usage });
 		const probes = new Map<string, Float32Array>();
-		if (viz) {
-			const bin = await fetchModelFile(`${base}/viz.bin`);
-			const h = new Uint16Array(bin, viz.lens.offset, viz.lens.bytes / 2);
-			const lens = new Float32Array(h.length);
-			for (let i = 0; i < h.length; i++) lens[i] = halfToFloat(h[i]);
-			device.queue.writeBuffer(dense, denseAt.get('viz.lens')! * 4, lens);
-			device.queue.writeBuffer(
-				dense,
-				denseAt.get('viz.probe')! * 4,
-				new Float32Array(bin, viz.probe.offset, 99)
-			);
-			for (const k of ['space_img', 'space_txt'] as const)
-				if (viz[k])
-					device.queue.writeBuffer(
-						dense,
-						denseAt.get(`viz.${k}`)! * 4,
-						new Float32Array(bin.slice(viz[k].offset, viz[k].offset + 3 * D * 4))
-					);
-			for (const k of ['probe64', 'probe128', 'probe256'] as const)
-				if (viz[k])
-					probes.set(k, new Float32Array(bin.slice(viz[k].offset, viz[k].offset + 195 * 4)));
-		}
+		if (viz) Painter.writeViz(device, viz, dense, denseAt, probes);
 		// fetch file by file, uploading as each arrives
 		const total = names.reduce(
 			(a, n) => a + (files.manifest.files as Record<string, { bytes: number }>)[n].bytes,
@@ -823,6 +805,62 @@ export class Painter {
 		return painter;
 	}
 
+	/** The visuals' readouts beside the painter's files (viz.json and viz.bin), or null where there are none. */
+	static async loadViz(base: string): Promise<PainterViz | null> {
+		const json = await fetchModelJson<PainterViz['json']>(`${base}/viz.json`).catch(() => null);
+		return json && { json, bin: await fetchModelFile(`${base}/viz.bin`) };
+	}
+
+	/** Make room for the readouts in the dense weights (from nd on); returns the new end. */
+	private static placeViz(
+		viz: PainterViz,
+		denseAt: Map<string, number>,
+		nd: number,
+		space: boolean
+	) {
+		const { json } = viz;
+		denseAt.set('viz.lens', nd);
+		nd += json.lens.shape.reduce((a, b) => a * b, 1);
+		denseAt.set('viz.probe', nd);
+		nd += 99;
+		if (space)
+			for (const k of ['space_img', 'space_txt'] as const)
+				if (json[k]) {
+					denseAt.set(`viz.${k}`, nd);
+					nd += 3 * D;
+				}
+		return nd;
+	}
+
+	/** Upload the readouts placed by placeViz; the decoder's stage probes go into probes (unless already there). */
+	private static writeViz(
+		device: GPUDevice,
+		viz: PainterViz,
+		dense: GPUBuffer,
+		denseAt: Map<string, number>,
+		probes: Map<string, Float32Array>
+	) {
+		const { json, bin } = viz;
+		const h = new Uint16Array(bin, json.lens.offset, json.lens.bytes / 2);
+		const lens = new Float32Array(h.length);
+		for (let i = 0; i < h.length; i++) lens[i] = halfToFloat(h[i]);
+		device.queue.writeBuffer(dense, denseAt.get('viz.lens')! * 4, lens);
+		device.queue.writeBuffer(
+			dense,
+			denseAt.get('viz.probe')! * 4,
+			new Float32Array(bin.slice(json.probe.offset, json.probe.offset + 99 * 4))
+		);
+		for (const k of ['space_img', 'space_txt'] as const)
+			if (json[k] && denseAt.has(`viz.${k}`))
+				device.queue.writeBuffer(
+					dense,
+					denseAt.get(`viz.${k}`)! * 4,
+					new Float32Array(bin.slice(json[k].offset, json[k].offset + 3 * D * 4))
+				);
+		for (const k of ['probe64', 'probe128', 'probe256'] as const)
+			if (json[k] && !probes.has(k))
+				probes.set(k, new Float32Array(bin.slice(json[k].offset, json[k].offset + 195 * 4)));
+	}
 	/**
 	 * The painter from the one-file model (see packed.ts): the fused conditioning map, the DiT and TAEF2, read in parts
 	 * and put on the GPU as they arrive (the ternary weights unpacked from trits).
@@ -830,7 +868,8 @@ export class Painter {
 	static async fromPacked(
 		device: GPUDevice,
 		model: PackedModel,
-		onProgress?: (p: PainterProgress) => void
+		onProgress?: (p: PainterProgress) => void,
+		viz?: PainterViz | null // the readouts for the visuals (the one-file model has only the decoder's stage probes)
 	): Promise<Painter> {
 		const ts = model.tensors('painter');
 		// a ternary tensor is the one with a `.scale` beside it (its stored type may be a deflate wrapper)
@@ -887,10 +926,13 @@ export class Painter {
 			denseAt.set(k, nd);
 			nd += 256 * 64;
 		}
+		if (viz) nd = Painter.placeViz(viz, denseAt, nd, false);
 		const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
 		const codes = device.createBuffer({ label: 'painter codes', size: nc * 4, usage });
 		const scales = device.createBuffer({ label: 'painter scales', size: ns * 4, usage });
 		const dense = device.createBuffer({ label: 'painter dense', size: nd * 4, usage });
+		const probes = new Map<string, Float32Array>();
+		if (viz) Painter.writeViz(device, viz, dense, denseAt, probes);
 		const loraBuf = nl
 			? device.createBuffer({ label: 'painter lora', size: nl * 4, usage })
 			: undefined;
@@ -939,7 +981,7 @@ export class Painter {
 			dense,
 			tern,
 			denseAt,
-			new Map(),
+			probes,
 			loraBuf ? { buf: loraBuf, at: loraAt, ranks } : undefined
 		);
 		// other step counts (sigmas and modulation per step), when the file carries them
@@ -1586,12 +1628,13 @@ export class Painter {
 			tasks.push(...this.tasks(ops.slice(from, to), budget));
 			from = to;
 			if (b < 0 && onInput && this.hasSpace) tasks.push(this.inputTask(onInput));
-			// without a lens there is no picture per block: when the step is done, its own clean guess is decoded (the
-			// last coarse step at 256 x 256 is enlarged and noised back for the next, see sketchTasks; earlier coarse
-			// steps show their enlarged guess, and keep their latent)
-			if (b === 25 && !lens)
+			// without a lens there is no picture per block: when the step is done, its own clean guess is decoded. A
+			// coarse step at 256 x 256 always ends so, lens or not: the last one is enlarged and noised back for the
+			// next (see sketchTasks); earlier ones show their enlarged guess, and keep their latent
+			const coarse = s < this.low;
+			if (b === 25 && (!lens || coarse))
 				tasks.push(
-					...(s < this.low
+					...(coarse
 						? this.sketchTasks(stage, budget, s === this.low - 1)
 						: this.guessTasks(s, stage, budget))
 				);
@@ -1605,7 +1648,7 @@ export class Painter {
 					onPicture && ((enc) => onPicture(enc, b))
 				)
 			);
-			if (b === 24 && lens) tasks.push(...this.taef2.decodeTasks(budget, stage));
+			if (b === 24 && lens && s >= this.low) tasks.push(...this.taef2.decodeTasks(budget, stage));
 		}
 		return tasks;
 	}
@@ -1773,7 +1816,7 @@ export class Painter {
 			ops.push({
 				k: 'kernel',
 				name: 'lens_x0',
-				p: [ni * CIN, at.vl, L + 3072 * CIN, at.lat, at.x0],
+				p: [ni * CIN, at.vl, L + 3072 * CIN, at.lat, at.x0, Math.round(Math.sqrt(ni))],
 				f: [this.sigmas[s]],
 				wg: [(ni * CIN) / 256, 1, 1]
 			});

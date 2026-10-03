@@ -99,6 +99,11 @@ export class Threads {
 	private ghosts: { text: string; layer: number; word: number; prob: number; pos: V3 }[] = [];
 	private raf = 0;
 	private last = 0;
+	// the drawing's resolution, as a share of the screen's: lowered while the painter works and frames run slow (the
+	// GPU draws the scene and paints in the same frames), raised again when they run fast
+	private scale = 1;
+	private slowFor = 0;
+	private fastFor = 0;
 	private observer: ResizeObserver;
 	private project: GPUComputePipeline;
 	private ready = false;
@@ -905,7 +910,8 @@ export class Threads {
 
 	private resize() {
 		const cv = this.gpu.canvas;
-		const dpr = Math.min(window.devicePixelRatio || 1, 2);
+		const screen = Math.min(window.devicePixelRatio || 1, 2);
+		const dpr = Math.max(Math.min(screen, 1), screen * this.scale);
 		const w = Math.max(1, Math.floor(cv.clientWidth * dpr)),
 			h = Math.max(1, Math.floor(cv.clientHeight * dpr));
 		if (w === cv.width && h === cv.height && this.post.sceneView) return;
@@ -945,13 +951,29 @@ export class Threads {
 		}
 		this.painting?.update();
 		if (this.ready && prog >= NL && this.handoffAt < 0) this.handoffAt = this.time;
-		// the GPU queue: bigger slices while nothing on screen needs to stay smooth (the reading, the handoff)
+		// the GPU queue: bigger slices while nothing on screen needs to stay smooth (the reading, the handoff); while
+		// the painting is on show, never less than a third of each frame, however heavy the scene
+		const frameMs = this.scheduler.frameMs;
 		this.scheduler.floor =
 			!this.ready || this.reading
 				? 30
 				: this.painting && this.painting.ticks >= 1 && prog >= NL
-					? 3
+					? Math.max(4, frameMs / 3)
 					: 10;
+		// while the painter works on a slow frame rate, draw at a lower resolution (a step at a time, at most half the
+		// screen's), and back up once frames come fast again
+		const working = !!this.painting && !this.painting.done && this.scheduler.pending > 0;
+		this.slowFor = working && frameMs > 21 ? this.slowFor + dt : 0;
+		this.fastFor = frameMs < 18 || !working ? this.fastFor + dt : 0;
+		if (this.slowFor > 1.5 && this.scale > 0.5) {
+			this.scale = Math.max(0.5, this.scale * 0.8);
+			this.slowFor = 0;
+			this.resize();
+		} else if (this.fastFor > 3 && this.scale < 1) {
+			this.scale = Math.min(1, this.scale / 0.8);
+			this.fastFor = 0;
+			this.resize();
+		}
 		// fade out while a new prompt is being read, back in when its journey begins
 		this.post.fade += ((this.reading ? 0 : 1) - this.post.fade) * (1 - Math.exp(-dt * 5));
 		if (this.painting?.ticks && !this.paused && prog >= NL && this.handoffProgress >= 1) {
@@ -1032,17 +1054,20 @@ export class Threads {
 		cam.dist += (want.dist - cam.dist) * k;
 		cam.yaw += (want.yaw - cam.yaw) * k;
 		cam.pitch += (want.pitch - cam.pitch) * k;
+		// the views are framed for a landscape screen; on a narrower one (a phone held upright) step back until the
+		// same width fits
+		const aspect = canvas.width / canvas.height;
+		const narrow = Math.max(1, Math.pow(1.45 / aspect, 0.85));
 		const target = cam.c,
 			yaw = cam.yaw + this.yawOff,
 			pitch = Math.max(-1.4, Math.min(1.4, cam.pitch + this.pitchOff)),
-			dist = cam.dist * this.distMul;
+			dist = cam.dist * this.distMul * narrow;
 		const eye: V3 = [
 			target[0] + dist * Math.cos(pitch) * Math.sin(yaw),
 			target[1] + dist * Math.sin(pitch),
 			target[2] + dist * Math.cos(pitch) * Math.cos(yaw)
 		];
-		const aspect = canvas.width / canvas.height,
-			fov = (38 * Math.PI) / 180;
+		const fov = (38 * Math.PI) / 180;
 		const vp = mat4.multiply(
 			mat4.perspective(fov, aspect, 0.05, 500),
 			mat4.lookAt(eye, target, [0, 1, 0])
@@ -1193,7 +1218,10 @@ export class Threads {
 					? `The painter, pass 1 of ${passes}: a sketch at a quarter of the size`
 					: `The painter, pass ${p + 1} of ${passes}`;
 				const patches = sketch ? '256' : '1,024';
-				const lens = !this.playback && !!this.painter?.hasLens;
+				// a picture per block: live where the painter has the tuned lens, in a recording where it kept them
+				const lens = this.playback
+					? this.playback.paint.some((e) => e.kind === 'picture')
+					: !!this.painter?.hasLens;
 				caption =
 					r < 25.5
 						? `${head}, block ${Math.min(25, Math.max(1, Math.round(r)))} of 25. Inside each block the picture's ${patches} patches read your words; the lower row shows where, in the words' colours. Your words run beneath as a cable: a word the picture reads hard climbs out to the spot it is read most, and its name lights up. The arcs are the words reading each other.${lens ? ' Then the block changes the picture (the upper row).' : ''}`

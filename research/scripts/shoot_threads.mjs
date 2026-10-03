@@ -9,11 +9,17 @@ const ctx = await chromium.launchPersistentContext(out + '/../profile', {
 		'/Users/neo/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
 	headless: true,
 	viewport: { width: 1280, height: 800 },
-	args: ['--enable-unsafe-webgpu', '--enable-features=Vulkan,WebGPU', '--use-angle=metal', '--ignore-gpu-blocklist']
+	args: [
+		'--enable-unsafe-webgpu',
+		'--enable-features=Vulkan,WebGPU',
+		'--use-angle=metal',
+		'--ignore-gpu-blocklist'
+	]
 });
 const page = ctx.pages()[0] ?? (await ctx.newPage());
 page.on('console', (m) => {
-	if (m.type() === 'error' || m.type() === 'warning') console.log('console', m.type(), m.text().slice(0, 300));
+	if (m.type() === 'error' || m.type() === 'warning')
+		console.log('console', m.type(), m.text().slice(0, 300));
 });
 page.on('pageerror', (e) => console.log('pageerror', e.message));
 await page.goto('http://localhost:5173/lab/threads');
@@ -36,7 +42,9 @@ for (const s of specs) {
 	else if (k === 'shot') {
 		await page.screenshot({ path: `${out}/${v}.png` });
 		const c = await caption();
-		console.log(`${((Date.now() - t0) / 1000).toFixed(1)}s ${v}: ${c.split('\n').slice(-3).join(' | ').slice(0, 200)}`);
+		console.log(
+			`${((Date.now() - t0) / 1000).toFixed(1)}s ${v}: ${c.split('\n').slice(-3).join(' | ').slice(0, 200)}`
+		);
 	} else if (k === 'click') {
 		const [x, y] = v.split(',').map(Number);
 		await page.mouse.click(x, y);

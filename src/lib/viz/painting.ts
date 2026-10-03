@@ -94,7 +94,8 @@ export class Painting {
 	// playing a recorded one: the events still to come, and the pictures decoded so far
 	private pending: PaintEvent[] = [];
 	private playT0 = 0;
-	private bitmaps = new Map<Blob, ImageBitmap>();
+	private bitmaps = new Map<Blob | ImageBitmap, ImageBitmap>();
+	private held = new Map<string, GPUTexture>(); // while recording: each block's picture, until it is read back
 
 	constructor(
 		private device: GPUDevice,
@@ -210,6 +211,11 @@ export class Painting {
 							attn: attn.slice(),
 							words: words?.slice() ?? new Float32Array()
 						});
+						const pic = this.held.get(`${s}:${b}`);
+						if (pic) {
+							this.held.delete(`${s}:${b}`);
+							this.notePicture(pic, (image) => ({ kind: 'picture', s, b, image }), true);
+						}
 						this.read(s, b, attn, words);
 					},
 					{
@@ -230,10 +236,23 @@ export class Painting {
 						}
 					},
 					scheduler.slice,
-					// every block's picture goes into the gallery as soon as it is made
+					// every block's picture goes into the gallery as soon as it is made (and, while recording, is
+					// kept to be read back once the block's work has run)
 					(enc, b) => {
 						const tick = s * TICKS_PER_STEP + b + 1;
 						this.gallery.addPicture(enc, early, tick, ...card(this.xOf(tick), PICTURES, BLOCK));
+						if (this.log) {
+							const tex = this.device.createTexture({
+								size: [early.width, early.height],
+								format: 'rgba8unorm',
+								usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC
+							});
+							enc.copyTextureToTexture({ texture: early }, { texture: tex }, [
+								early.width,
+								early.height
+							]);
+							this.held.set(`${s}:${b}`, tex);
+						}
 					}
 				)
 			);
@@ -463,12 +482,17 @@ export class Painting {
 	}
 
 	/** While recording: a picture, read back from its texture (the event keeps the time it was made). */
-	private notePicture(tex: GPUTexture, event: (image: Blob) => DistributiveOmit<PaintEvent, 't'>) {
+	private notePicture(
+		tex: GPUTexture,
+		event: (image: Blob) => DistributiveOmit<PaintEvent, 't'>,
+		free = false // the texture was made for this: destroy it once read
+	) {
 		const log = this.log;
 		if (!log) return;
 		const t = performance.now();
 		log.waiting++;
 		textureImage(this.device, tex).then((image) => {
+			if (free) tex.destroy();
 			this.note(event(image), t);
 			log.events.sort((a, b) => a.t - b.t);
 			log.waiting--;
@@ -487,7 +511,7 @@ export class Painting {
 		this.pending = [...events];
 		this.playT0 = performance.now();
 		for (const e of events)
-			if (e.kind === 'stage' || e.kind === 'final')
+			if (e.kind === 'stage' || e.kind === 'final' || e.kind === 'picture')
 				createImageBitmap(e.image).then((b) => this.bitmaps.set(e.image, b));
 	}
 
@@ -502,7 +526,26 @@ export class Painting {
 			else {
 				const image = this.bitmaps.get(e.image);
 				if (!image) return; // still decoding: wait for it, keeping the order
-				if (e.kind === 'stage') {
+				if (e.kind === 'picture') {
+					// a block's picture, into the gallery as the live run puts it there
+					const tick = e.s * TICKS_PER_STEP + e.b + 1;
+					const tex = this.device.createTexture({
+						size: [image.width, image.height],
+						format: 'rgba8unorm',
+						usage:
+							GPUTextureUsage.COPY_SRC |
+							GPUTextureUsage.COPY_DST |
+							GPUTextureUsage.RENDER_ATTACHMENT
+					});
+					this.device.queue.copyExternalImageToTexture({ source: image }, { texture: tex }, [
+						image.width,
+						image.height
+					]);
+					const enc = this.device.createCommandEncoder();
+					this.gallery.addPicture(enc, tex, tick, ...card(this.xOf(tick), PICTURES, BLOCK));
+					this.device.queue.submit([enc.finish()]);
+					tex.destroy();
+				} else if (e.kind === 'stage') {
 					this.standImage(image, e.s * TICKS_PER_STEP + 25 + Math.log2(e.res / 64), STAGE[e.res]);
 					this.ticks = Math.max(this.ticks, e.s * TICKS_PER_STEP + 26 + Math.log2(e.res / 64));
 				} else {

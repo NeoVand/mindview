@@ -15,17 +15,24 @@
 	import { BonsaiLLM as Reader } from '$lib/runtime/bonsai-llm';
 	import { PackedModel } from '$lib/runtime/packed';
 	import { Painter as ThePainter } from '$lib/runtime/painter';
+	import SiteHeader, { type NavLink } from '$lib/ui/SiteHeader.svelte';
+	import NeedsComputer from '$lib/ui/NeedsComputer.svelte';
+	import { mayLoad } from '$lib/lab/device';
+	import Paintbrush from '@lucide/svelte/icons/paintbrush';
+	import Dices from '@lucide/svelte/icons/dices';
+	import Download from '@lucide/svelte/icons/download';
+	import ArrowUpRight from '@lucide/svelte/icons/arrow-up-right';
 
 	interface Link {
 		href: string;
 		label: string;
 	}
 	let {
-		elsewhere,
+		header,
 		compute,
 		newTab = false
 	}: {
-		elsewhere: Link[]; // top right: the rest of mindview
+		header?: { home: string; links: NavLink[] }; // a bar of its own (the Space; on the site the layout has one)
 		compute: Link; // under the description: where to see it compute
 		newTab?: boolean; // links open in a new tab (in the Space, which runs in a frame)
 	} = $props();
@@ -42,13 +49,38 @@
 	let painted = $state(false);
 	let result = $state('');
 	let error = $state<string | null>(null);
+	let blocked = $state<{ why: string; go: () => void } | null>(null); // the model may not fit here
 	// instant: 1 step with the 1-step fine-tune (when the model has it); fast: 2 steps with the few-step LoRA, the first
 	// at 256 x 256 (when the model has it); best: 4 steps
 	// quick: Best's 4 steps with the first three at 256 x 256 (untrained: about half of Best's time, most prompts as good)
 	let mode = $state<'instant' | 'fast' | 'best' | 'quick'>('fast');
+	const MODES = [
+		{
+			id: 'instant',
+			label: 'Instant',
+			about:
+				'One step, with the branch trained for it. About 4 s on an M4 MacBook Air; the roughest.'
+		},
+		{
+			id: 'fast',
+			label: 'Fast',
+			about: 'Two steps: a sketch at a quarter of the size, then the picture. About 6 s.'
+		},
+		{
+			id: 'quick',
+			label: 'Quick Best',
+			about:
+				'Best with its first three steps at a quarter of the size: about half the time. Not trained for it yet, so some prompts lose a little.'
+		},
+		{ id: 'best', label: 'Best', about: 'Four full steps, the most faithful. About 15 s.' }
+	] as const;
+	const modes = $derived(MODES.filter((m) => m.id !== 'instant' || instantAvailable));
+	const about = $derived(MODES.find((m) => m.id === mode)?.about ?? '');
+	let frames = $state<string[]>([]); // what it had in mind after each step, small
 	let fastAvailable = $state(false);
 	let instantAvailable = $state(false);
 	let canvas: HTMLCanvasElement | undefined;
+	let figure: HTMLElement | undefined;
 	let device: GPUDevice | undefined;
 
 	function load() {
@@ -81,6 +113,9 @@
 		canvas = c;
 		let alive = true;
 		(async () => {
+			// painting keeps about 2.8 GB on the GPU: on a phone, ask first
+			await mayLoad(2.8, 890, (why, go) => (blocked = { why, go }));
+			blocked = null;
 			device = await labDevice();
 			const { megabytes } = await load();
 			if (!alive) return;
@@ -116,6 +151,7 @@
 		buf.destroy();
 		canvas.getContext('2d')!.putImageData(new ImageData(px, 512, 512), 0, 0);
 		painted = true;
+		frames = [...frames, canvas.toDataURL('image/jpeg', 0.75)];
 	}
 
 	async function paint(e?: SubmitEvent) {
@@ -124,7 +160,12 @@
 		if (!ready || painting || !text) return;
 		painting = true;
 		result = '';
+		frames = [];
 		error = null;
+		// on a phone the picture is below the controls: bring it into view
+		const box = figure?.getBoundingClientRect();
+		if (box && box.bottom > innerHeight)
+			figure?.scrollIntoView({ behavior: 'smooth', block: 'end' });
 		try {
 			const { llm, painter } = await load();
 			const t0 = performance.now();
@@ -135,12 +176,14 @@
 			// at 2 steps the pads matter more: keep 256 text rows (1 and 4 steps need only the prompt and a few)
 			painter.textLength = steps === 2 ? 256 : 'auto';
 			status = 'Reading your words';
+			progress = 0;
 			await painter.encode(llm, text);
 			// coarse first steps at 256 x 256 (a quarter of the work each): Fast's first, Quick's first three
 			const low = steps === 2 ? 1 : mode === 'quick' ? 3 : 0;
 			painter.setNoise(undefined, seed, low);
 			for (let s = 0; s < steps; s++) {
 				status = steps === 1 ? 'Painting, in one step' : `Painting: step ${s + 1} of ${steps}`;
+				progress = s / steps;
 				await painter.step(s);
 				// what it has in mind after this step (after the last: the picture itself); the coarse steps before the
 				// last one keep their latent, so nothing is shown for them
@@ -149,6 +192,7 @@
 				else await painter.decode(painter.sigmas[s + 1]);
 				await show(painter);
 			}
+			progress = null;
 			const secs = ((performance.now() - t0) / 1000).toFixed(1);
 			status = '';
 			result = `Painted in ${secs} s on this computer, from seed ${seed}.`;
@@ -189,278 +233,237 @@
 	}
 </script>
 
+{#if header}
+	<SiteHeader home={header.home} links={header.links} {newTab} />
+{/if}
 <main>
-	<nav aria-label="Elsewhere">
-		{#each elsewhere as l (l.href)}
-			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- the caller resolves it (the site) or gives a full URL (the Space) -->
-			<a href={l.href} {target} {rel}>{l.label}</a>
-		{/each}
-	</nav>
-
 	<section class="controls">
+		<h1>Paint</h1>
+		<p class="sub">
+			Type something and this tab paints it, on your graphics card, from one file of about a
+			gigabyte.
+		</p>
 		<form onsubmit={paint}>
 			<textarea
+				class="prompt"
 				bind:value={prompt}
 				onkeydown={promptKey}
 				rows="2"
 				placeholder="Describe a picture"
 				aria-label="Describe a picture; Enter paints it"
 				spellcheck="false"></textarea>
+			{#if fastAvailable}
+				<div class="seg modes" role="radiogroup" aria-label="Speed">
+					{#each modes as m (m.id)}
+						<label>
+							<input type="radio" bind:group={mode} value={m.id} disabled={painting} />{m.label}
+						</label>
+					{/each}
+				</div>
+				<p class="hint mode-about">{about}</p>
+			{/if}
 			<div class="row">
-				<button type="submit" class="primary" disabled={!ready || painting}
-					>{painting ? 'Painting…' : 'Paint'}</button
-				>
-				<label>
+				<button type="submit" class="btn primary lg" disabled={!ready || painting}>
+					<Paintbrush />{painting ? 'Painting' : 'Paint'}
+				</button>
+				<label class="field">
 					Seed
 					<input type="number" min="0" step="1" bind:value={seed} disabled={painting} />
 				</label>
-				<button type="button" onclick={newSeed} disabled={!ready || painting}>New seed</button>
-				{#if fastAvailable}
-					<div class="mode" role="radiogroup" aria-label="Speed">
-						{#if instantAvailable}
-							<label class:on={mode === 'instant'}>
-								<input type="radio" bind:group={mode} value="instant" disabled={painting} />Instant,
-								1 step
-							</label>
-						{/if}
-						<label class:on={mode === 'fast'}>
-							<input type="radio" bind:group={mode} value="fast" disabled={painting} />Fast, 2 steps
-						</label>
-						<label class:on={mode === 'best'}>
-							<input type="radio" bind:group={mode} value="best" disabled={painting} />Best, 4 steps
-						</label>
-						<label class:on={mode === 'quick'}>
-							<input type="radio" bind:group={mode} value="quick" disabled={painting} />Quick Best
-						</label>
-					</div>
-				{/if}
+				<button
+					type="button"
+					class="btn icon"
+					onclick={newSeed}
+					disabled={!ready || painting}
+					aria-label="Paint again from a new seed"
+					title="Paint again from a new seed"><Dices /></button
+				>
 			</div>
 		</form>
 
 		<div class="status" aria-live="polite">
 			{#if error}
-				<p role="alert">{error}</p>
+				<p role="alert" class="error">{error}</p>
 			{:else if result}
 				<p>{result}</p>
 			{:else}
 				<p>{status}</p>
 				{#if progress !== null}
-					<div class="bar"><span style:transform="scaleX({progress})"></span></div>
+					<div class="progress"><span style:transform="scaleX({progress})"></span></div>
 				{/if}
 			{/if}
 		</div>
 	</section>
 
-	<figure class:painted class:busy={painting}>
-		<canvas {@attach mount} width="512" height="512" aria-label="The painted picture"></canvas>
-		{#if !painted}
-			<figcaption class="empty">The picture appears here</figcaption>
-		{/if}
-		{#if painted && !painting}
-			<button type="button" class="save" onclick={save}>Save the picture</button>
-		{/if}
-	</figure>
+	{#if blocked}
+		<NeedsComputer why={blocked.why} ontry={blocked.go} home={!header} />
+	{/if}
+	<section class="work">
+		<figure bind:this={figure} class:painted class:busy={painting}>
+			<canvas {@attach mount} width="512" height="512" aria-label="The painted picture"></canvas>
+			{#if !painted}
+				<figcaption class="empty">The picture appears here</figcaption>
+			{/if}
+		</figure>
+		<div class="under">
+			<ol class="frames" aria-label="What it had in mind after each step">
+				{#each frames as f, i (i)}
+					<li><img src={f} alt="After step {i + 1}" /></li>
+				{/each}
+			</ol>
+			{#if painted && !painting}
+				<button type="button" class="btn" onclick={save}><Download />Save</button>
+			{/if}
+		</div>
+	</section>
 
-	<section class="about">
+	<details class="about">
+		<summary>How it paints</summary>
 		<p>
-			One file of about a gigabyte paints this, on your GPU, in this tab. Ternary Bonsai 1.7B reads
-			your words with its first 9 layers; a linear map turns them into the painter's conditioning;
-			the ternary diffusion transformer of Bonsai Image 4B paints in one, two or four steps, each
-			with a small side branch trained for it; TAEF2 turns the result into pixels. Nearly every
-			weight is −1, 0 or +1. Quick Best is Best with three of its four steps at a quarter of the
-			size: about half the time, and (still untrained) most prompts come out as well.
+			Ternary Bonsai 1.7B reads your words with its first 9 layers; a linear map turns them into the
+			painter's conditioning; the ternary diffusion transformer of Bonsai Image 4B paints in one,
+			two or four steps, each with a small side branch trained for it; TAEF2 turns the result into
+			pixels. Nearly every weight is −1, 0 or +1, and all of it is one file.
 		</p>
 		<p class="links">
-			<a href={HF} {target} {rel}>The model on Hugging Face</a>
-			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- as above -->
-			<a href={compute.href} {target} {rel}>{compute.label}</a>
+			<a href={HF} {target} {rel}>The model on Hugging Face<ArrowUpRight /></a>
+			<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- the caller resolves it (the site) or gives a full URL (the Space) -->
+			<a href={compute.href} {target} {rel}>{compute.label}<ArrowUpRight /></a>
 		</p>
-	</section>
+	</details>
 </main>
 
 <style>
 	main {
-		/* the site locks the page itself (app.css); this page scrolls inside main, which phones need */
+		/* the site locks the page itself; this page scrolls inside main, which phones need */
 		position: fixed;
 		inset: 0;
 		overflow-y: auto;
 		box-sizing: border-box;
 		display: grid;
-		grid-template-columns: minmax(18rem, 30rem) 1fr;
-		grid-template-rows: 1fr 1fr;
-		column-gap: 3rem;
-		padding: 4.5rem 3rem 3rem;
+		grid-template-columns: minmax(20rem, 30rem) minmax(0, 1fr);
+		grid-template-rows: 1fr auto 1fr;
+		grid-template-areas: '. work' 'controls work' 'about work';
+		column-gap: clamp(2rem, 5vw, 5rem);
+		padding: calc(var(--header-h) + 1rem) var(--gutter) 2rem;
 		background: var(--void);
 		color: var(--bone);
 	}
-	nav {
-		position: absolute;
-		top: 1.1rem;
-		right: 1.4rem;
-		display: flex;
-		gap: 1.1rem;
-		font-size: 0.82rem;
+	h1 {
+		margin: 0;
+		font: 300 clamp(2rem, 3.4vw, 2.8rem) / 1.1 var(--serif);
+		letter-spacing: -0.01em;
 	}
-	nav a,
-	.links a {
-		color: var(--bone);
-		opacity: 0.6;
-		text-decoration: none;
-		border-bottom: 1px solid transparent;
+	.sub {
+		margin: 0.6rem 0 1.8rem;
+		max-width: 26rem;
+		color: var(--bone-2);
+		font: 300 var(--t-md) / 1.5 var(--serif);
 	}
-	nav a:hover,
-	nav a:focus-visible,
-	.links a:hover,
-	.links a:focus-visible {
-		opacity: 1;
-		border-bottom-color: var(--ember);
-		outline: none;
+	.prompt {
+		--prompt-size: clamp(1.35rem, 2vw, 1.75rem);
+		min-height: 4.2rem;
 	}
-	textarea {
-		display: block;
-		width: 100%;
-		box-sizing: border-box;
-		field-sizing: content;
-		min-height: 4.5rem;
-		max-height: 40vh;
-		resize: none;
-		background: none;
-		border: none;
-		border-bottom: 1px solid rgb(232 226 214 / 0.2);
-		color: var(--bone);
-		font: italic 300 clamp(1.4rem, 2.2vw, 2.1rem) / 1.3 var(--serif);
-		padding: 0.3rem 0 0.6rem;
-		outline: none;
+	.modes {
+		margin-top: 1.4rem;
 	}
-	textarea::placeholder {
-		color: var(--bone);
-		opacity: 0.35;
-	}
-	textarea:focus-visible {
-		border-bottom-color: var(--ember);
+	.mode-about {
+		min-height: 2.9em;
+		margin: 0.55rem 0 0;
+		max-width: 28rem;
 	}
 	.row {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
-		gap: 0.8rem 1rem;
-		margin-top: 1.1rem;
-		font-size: 0.9rem;
+		gap: 0.75rem;
+		margin-top: 1.3rem;
 	}
-	label {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		opacity: 0.8;
-	}
-	input[type='number'] {
-		width: 6.5rem;
-		background: none;
-		border: 1px solid rgb(232 226 214 / 0.25);
-		color: var(--bone);
-		font: inherit;
-		padding: 0.3rem 0.5rem;
-		font-variant-numeric: tabular-nums;
-	}
-	button {
-		background: none;
-		border: 1px solid rgb(232 226 214 / 0.3);
-		color: var(--bone);
-		font: inherit;
-		font-size: 0.9rem;
-		padding: 0.4rem 0.9rem;
-		cursor: pointer;
-	}
-	button.primary {
-		border-color: var(--ember);
-		color: var(--ember);
-		padding: 0.45rem 1.4rem;
-		min-width: 7.5rem;
-	}
-	button:disabled {
-		opacity: 0.4;
-		cursor: default;
-	}
-	button:focus-visible,
-	input:focus-visible {
-		outline: 1px solid var(--ember);
-		outline-offset: 2px;
-	}
-	.mode {
-		display: flex;
-		border: 1px solid rgb(232 226 214 / 0.25);
-	}
-	.mode label {
-		padding: 0.35rem 0.7rem;
-		cursor: pointer;
-		opacity: 0.6;
-	}
-	.mode label.on {
-		opacity: 1;
-		background: rgb(232 226 214 / 0.1);
-	}
-	.mode label:has(input:focus-visible) {
-		outline: 1px solid var(--ember);
-	}
-	.mode input {
-		position: absolute;
-		opacity: 0;
-		pointer-events: none;
+	.row .btn.primary {
+		min-width: 8.5rem;
 	}
 	.status {
-		min-height: 3.2rem;
+		min-height: 3rem;
 		margin-top: 1.4rem;
-		font-weight: 300;
-		font-size: 0.95rem;
-		line-height: 1.5;
+		color: var(--bone-2);
+		font: 400 var(--t-sm) / 1.5 var(--sans);
 	}
 	.status p {
 		margin: 0;
-		opacity: 0.8;
 	}
-	.bar {
-		height: 1px;
-		margin-top: 0.7rem;
-		background: rgb(232 226 214 / 0.15);
+	.status .error {
+		color: var(--ember);
 	}
-	.bar span {
-		display: block;
-		height: 100%;
-		background: var(--ember);
-		transform-origin: left;
-		transition: transform 0.2s linear;
+	.status .progress {
+		margin-top: 0.6rem;
+		max-width: 26rem;
 	}
 	.controls {
-		align-self: end;
+		grid-area: controls;
 	}
 	.about {
+		grid-area: about;
 		align-self: start;
+		margin-top: 0.8rem;
+		max-width: 30rem;
+		border-top: 1px solid var(--hair);
+		padding-top: 0.8rem;
 	}
-	.about p:first-child {
-		max-width: 60ch;
-		margin: 0.6rem 0 0;
-		font-weight: 300;
-		font-size: 0.92rem;
-		line-height: 1.6;
-		opacity: 0.62;
+	.about summary {
+		width: fit-content;
+		color: var(--bone-2);
+		font: 500 var(--t-sm) / 1.6 var(--sans);
+		cursor: pointer;
+	}
+	.about summary:hover {
+		color: var(--bone);
+	}
+	.about p {
+		margin: 0.7rem 0 0;
+		color: var(--bone-2);
+		font: 300 var(--t-base) / 1.6 var(--serif);
 	}
 	.links {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 0.6rem 1.4rem;
-		margin: 1rem 0 0;
-		font-size: 0.88rem;
+		gap: 0.4rem 1.3rem;
+	}
+	.links a {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.2rem;
+		color: var(--bone);
+		font: 500 var(--t-sm) / 1.6 var(--sans);
+		text-decoration: none;
+		border-bottom: 1px solid var(--hair-2);
+	}
+	.links a:hover {
+		border-bottom-color: var(--ember);
+	}
+	.links :global(svg) {
+		width: 0.9rem;
+		height: 0.9rem;
+		color: var(--bone-3);
+	}
+	.work {
+		grid-area: work;
+		align-self: center;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		min-width: 0;
 	}
 	figure {
-		grid-column: 2;
-		grid-row: 1 / 3;
-		align-self: center;
 		position: relative;
 		margin: 0;
-		justify-self: center;
-		width: min(78vh, 100%);
+		width: min(calc(100vh - var(--header-h) - 9rem), 100%);
+		max-width: 46rem;
+		min-width: 16rem;
 		aspect-ratio: 1;
-		border: 1px solid rgb(232 226 214 / 0.12);
+		border: 1px solid var(--hair);
+		border-radius: var(--r-sm);
+		overflow: hidden;
+		background: radial-gradient(circle at 50% 45%, rgb(236 229 216 / 0.035), transparent 70%);
 	}
 	figure.painted {
 		border-color: transparent;
@@ -476,39 +479,60 @@
 		opacity: 1;
 	}
 	figure.busy canvas {
-		opacity: 0.75;
+		opacity: 0.8;
 	}
 	.empty {
 		position: absolute;
 		inset: 0;
 		display: grid;
 		place-items: center;
-		font-style: italic;
-		font-weight: 300;
-		opacity: 0.3;
+		color: var(--bone-3);
+		font: italic 300 var(--t-md) / 1 var(--serif);
 	}
-	.save {
-		position: absolute;
-		right: 0;
-		bottom: -2.8rem;
+	.under {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		width: min(calc(100vh - var(--header-h) - 9rem), 100%);
+		max-width: 46rem;
+		min-width: 16rem;
+		min-height: 3rem;
+		margin-top: 0.75rem;
 	}
-	@media (max-width: 800px) {
+	.frames {
+		display: flex;
+		gap: 0.4rem;
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+	.frames img {
+		display: block;
+		width: 2.75rem;
+		height: 2.75rem;
+		border-radius: 4px;
+		opacity: 0.85;
+	}
+	@media (max-width: 860px) {
 		main {
-			grid-template-columns: 1fr;
-			grid-template-rows: none;
+			display: flex;
+			flex-direction: column;
+			align-items: stretch;
 			gap: 1.5rem;
-			padding: 4rem 1rem 4rem;
+			padding: calc(var(--header-h) + 0.5rem) var(--gutter) 3rem;
 		}
-		figure {
-			grid-column: auto;
-			grid-row: auto;
+		.sub {
+			margin-bottom: 1.2rem;
+		}
+		figure,
+		.under {
 			width: 100%;
-			margin-bottom: 2.8rem;
+			min-width: 0;
 		}
 	}
 	@media (prefers-reduced-motion: reduce) {
-		canvas,
-		.bar span {
+		canvas {
 			transition: none;
 		}
 	}

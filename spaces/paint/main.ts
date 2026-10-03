@@ -2,17 +2,21 @@
 import { mount } from 'svelte';
 import '../../src/routes/layout.css';
 import Paint from '$lib/paint/Paint.svelte';
+import FlaskConical from '@lucide/svelte/icons/flask-conical';
+import Spline from '@lucide/svelte/icons/spline';
 
 const SITE = 'https://neovand.github.io/mindview';
 
 mount(Paint, {
 	target: document.getElementById('app')!,
 	props: {
-		elsewhere: [
-			{ href: `${SITE}/`, label: 'The piece' },
-			{ href: `${SITE}/lab`, label: 'The labs' },
-			{ href: 'https://github.com/NeoVand/mindview', label: 'The code' }
-		],
+		header: {
+			home: `${SITE}/`,
+			links: [
+				{ href: `${SITE}/`, label: 'The piece', icon: Spline },
+				{ href: `${SITE}/lab`, label: 'Labs', icon: FlaskConical }
+			]
+		},
 		compute: { href: `${SITE}/`, label: 'Watch it compute, on the mindview site' },
 		newTab: true
 	}

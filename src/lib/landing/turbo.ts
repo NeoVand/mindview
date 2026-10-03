@@ -1,6 +1,8 @@
 // The landing's models: the one-file mindview-t2i-turbo, read once and kept while the site is open. The reader (its
-// first part, 158 MB) arrives first and can start reading while the painter (the rest) is still downloading.
-import { packedUrl, TURBO_REVISION } from '$lib/models';
+// first part, 158 MB) arrives first and can start reading while the painter (the rest) is still downloading. Beside it,
+// the painter's readouts for the visuals (20 MB, from mindview-painter): the tuned lens, which shows the picture each
+// block has in mind, as /lab/threads does.
+import { packedUrl, painterUrl, TURBO_REVISION } from '$lib/models';
 import { ensureFonts } from '$lib/engine/text';
 import { BonsaiLLM } from '$lib/runtime/bonsai-llm';
 import { PackedModel } from '$lib/runtime/packed';
@@ -83,18 +85,22 @@ export async function turboPainter(
 	if (onProgress) listeners.add(onProgress);
 	try {
 		painter ??= (async () => {
-			const p = await file();
+			const [p, viz] = await Promise.all([file(), Painter.loadViz(painterUrl()).catch(() => null)]);
 			const s = await sizes();
 			const total = s.reader + s.painter;
-			return Painter.fromPacked(device, p, (e) =>
-				listeners.forEach((l) =>
-					l({
-						stage: 'painter',
-						fraction: e.fraction,
-						megabytes: s.reader + e.fraction * s.painter,
-						total
-					})
-				)
+			return Painter.fromPacked(
+				device,
+				p,
+				(e) =>
+					listeners.forEach((l) =>
+						l({
+							stage: 'painter',
+							fraction: e.fraction,
+							megabytes: s.reader + e.fraction * s.painter,
+							total
+						})
+					),
+				viz
 			);
 		})().catch((e) => {
 			painter = undefined;

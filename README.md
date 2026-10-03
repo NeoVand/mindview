@@ -63,8 +63,9 @@ painter in the browser matches PyTorch block for block, with cosine 1.000000.
 
 The landing and `/paint` run the one-file model: the reader cut to 9 layers, the map from layers 3, 6 and 9, and the
 trained side branches. The labs run the full pipeline, because they show all of it: the whole reader, a ternary
-adapter from layers 7, 14 and 21, and the painter in four steps with a per-block lens, a small readout that shows the
-picture each block has in mind.
+adapter from layers 7, 14 and 21, and the painter in four steps. Both show the picture each block has in mind through
+a per-block lens, a small readout fitted to the painter (20 MB, read from the painter's repository beside the one-file
+model).
 
 ## Making it small and fast
 
@@ -168,8 +169,11 @@ softer. The Air has no fan and slows by about a third after minutes of painting.
 
 You need:
 
-- A browser with WebGPU: a recent Chrome or Edge. It is developed and tested in Chrome on an Apple M4.
-- A GPU with about 3 GB to spare.
+- A browser with WebGPU: a recent Chrome or Edge. It is developed and tested in Chrome on an Apple M4; Safari 26
+  plays the recorded run.
+- A GPU with about 3 GB to spare: the labs keep about 3 GB on it, a live run of the landing or of `/paint` about
+  2.8 GB. A phone gives a web page less than that (Safari on an iPhone reloads a tab at about 1.5 to 3 GB), so on a
+  phone the recorded run plays and the live pages ask before they load.
 - Room for the downloads on the first visit: 1.2 GB for a live run on the landing or for `/paint`, about 1.6 GB for
   the labs. The browser keeps them in Cache Storage for later visits.
 

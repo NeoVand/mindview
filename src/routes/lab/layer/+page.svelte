@@ -12,6 +12,16 @@
 	import { Block } from '$lib/lab/block';
 	import type { BonsaiLLM } from '$lib/runtime/bonsai-llm';
 	import type { Painter } from '$lib/runtime/painter';
+	import Status from '$lib/ui/Status.svelte';
+	import NeedsComputer from '$lib/ui/NeedsComputer.svelte';
+	import { mayLoad } from '$lib/lab/device';
+	import ChevronLeft from '@lucide/svelte/icons/chevron-left';
+	import ChevronRight from '@lucide/svelte/icons/chevron-right';
+	import Pause from '@lucide/svelte/icons/pause';
+	import Play from '@lucide/svelte/icons/play';
+	import BookOpenText from '@lucide/svelte/icons/book-open-text';
+	import Paintbrush from '@lucide/svelte/icons/paintbrush';
+	import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
 	const NT = 512;
 	let lab: Layer | undefined;
@@ -23,6 +33,7 @@
 	let progress = $state(0);
 	let ready = $state(false);
 	let error = $state<string | null>(null);
+	let blocked = $state<{ why: string; go: () => void } | null>(null); // the models may not fit here
 	let prompt = $state('a bonsai tree made of glowing circuitry in a dark museum, volumetric light');
 	let mode = $state<'reader' | 'painter'>('reader');
 	let words = $state<string[]>([]);
@@ -40,6 +51,7 @@
 	let busy = $state('');
 	let labels = $state<LayerLabel[]>([]);
 	let tip = $state<{ x: number; y: number; title: string; lines: string[] } | null>(null);
+	let more = $state(true); // on a phone the choices under the prompt can be folded away
 
 	const scene = () => (mode === 'painter' && block ? block : lab);
 
@@ -56,6 +68,9 @@
 		canvas.addEventListener('pointermove', hover);
 		canvas.addEventListener('pointerleave', leave);
 		(async () => {
+			// the labs keep about 3 GB on the GPU: on a phone, ask first
+			await mayLoad(3, 890, (why, go) => (blocked = { why, go }));
+			blocked = null;
 			const gpu = await labGPU(canvas);
 			loading = 'Loading Ternary Bonsai 1.7B (460 MB, kept after the first time)';
 			llm = await labModel(gpu.device, (f) => (progress = f));
@@ -226,12 +241,13 @@
 <svelte:head><title>One layer</title></svelte:head>
 <svelte:window {onkeydown} />
 
-<main>
+<main class="lab-main">
 	<canvas
+		class="lab-canvas"
 		{@attach mount}
-		aria-label="One word or patch through one layer of the reader or one block of the painter, every number; drag to turn, right-drag to move, scroll to come closer"
+		aria-label="One word or patch through one layer of the reader or one block of the painter, every number; drag to turn, right-drag or two fingers to move, scroll or pinch to come closer"
 	></canvas>
-	<div class="labels" aria-hidden="true">
+	<div class="lab-labels" aria-hidden="true">
 		{#each labels as l, i (i)}
 			<span
 				class={l.align ?? 'center'}
@@ -243,105 +259,145 @@
 			>
 		{/each}
 	</div>
-	{#if error}
-		<p class="note" role="alert">{error}</p>
+	{#if blocked}
+		<NeedsComputer why={blocked.why} ontry={blocked.go} />
+	{:else if error}
+		<Status text={error} error />
 	{:else if !ready}
-		<div class="note">
-			<p>{loading}</p>
-			<div class="bar"><span style:transform="scaleX({progress})"></span></div>
-		</div>
+		<Status text={loading} {progress} />
 	{:else}
-		<form onsubmit={submit}>
-			<textarea
-				bind:value={prompt}
-				onkeydown={promptKey}
-				rows="1"
-				aria-label="Type something for the models to read and paint; Enter to start"
-				spellcheck="false"></textarea>
-			<div class="modes" role="group" aria-label="Which model">
-				<button type="button" class:on={mode === 'reader'} onclick={toReader}
-					>The reader: one layer</button
-				>
-				<button type="button" class:on={mode === 'painter'} onclick={toPainter}
-					>The painter: one block</button
+		<form onsubmit={submit} class="lab-ask" class:folded={!more}>
+			<div class="top">
+				<textarea
+					class="prompt"
+					bind:value={prompt}
+					onkeydown={promptKey}
+					rows="1"
+					aria-label="Type something for the models to read and paint; Enter to start"
+					spellcheck="false"></textarea>
+				<button
+					type="button"
+					class="btn quiet icon more-toggle"
+					aria-label={more ? 'Hide the choices' : 'Show the choices'}
+					aria-expanded={more}
+					onclick={() => (more = !more)}><SlidersHorizontal /></button
 				>
 			</div>
-			<div class="words" role="group" aria-label="Choose the word to follow">
-				{#each words as w, i (i)}
-					<button
-						type="button"
-						class:on={mode === 'painter' ? isWord && row === 3 + i : i === chosen}
-						onclick={() => choose(i)}>{w}</button
+			<div class="more">
+				<div class="seg" role="group" aria-label="Which model">
+					<button type="button" aria-pressed={mode === 'reader'} onclick={toReader}
+						><BookOpenText /><span class="long">The reader:</span> one layer</button
 					>
-				{/each}
-			</div>
-			{#if mode === 'reader'}
-				<div class="options">
-					<label>
-						Layer
-						<input type="range" min="1" max="28" bind:value={layer} onchange={setLayer} />
-						<span class="num">{layer}</span>
-					</label>
+					<button type="button" aria-pressed={mode === 'painter'} onclick={toPainter}
+						><Paintbrush /><span class="long">The painter:</span> one block</button
+					>
 				</div>
-			{:else}
-				<div class="options">
-					<div class="patches" role="group" aria-label="Or a patch of the picture">
-						<span class="hint">or a patch</span>
-						<div class="grid">
-							{#each FOLLOWED_PATCHES as p (p)}
-								<button
-									type="button"
-									class:on={row === NT + p}
-									style:left="{((p % 32) + 0.5) * (100 / 32)}%"
-									style:top="{(Math.floor(p / 32) + 0.5) * (100 / 32)}%"
-									aria-label="The patch at row {Math.floor(p / 32) + 1}, column {(p % 32) + 1}"
-									onclick={() => choosePatch(p)}
-								></button>
-							{/each}
+				<div class="chips" role="group" aria-label="Choose the word to follow">
+					{#each words as w, i (i)}
+						<button
+							type="button"
+							class="chip"
+							aria-pressed={mode === 'painter' ? isWord && row === 3 + i : i === chosen}
+							onclick={() => choose(i)}>{w}</button
+						>
+					{/each}
+				</div>
+				{#if mode === 'reader'}
+					<div class="lab-options">
+						<label class="field">
+							Layer
+							<input type="range" min="1" max="28" bind:value={layer} onchange={setLayer} />
+							<span class="value">{layer}</span>
+						</label>
+					</div>
+				{:else}
+					<div class="lab-options">
+						<div class="patches" role="group" aria-label="Or a patch of the picture">
+							<span class="field">or a patch</span>
+							<div class="grid">
+								{#each FOLLOWED_PATCHES as p (p)}
+									<button
+										type="button"
+										class:on={row === NT + p}
+										style:left="{((p % 32) + 0.5) * (100 / 32)}%"
+										style:top="{(Math.floor(p / 32) + 0.5) * (100 / 32)}%"
+										aria-label="The patch at row {Math.floor(p / 32) + 1}, column {(p % 32) + 1}"
+										onclick={() => choosePatch(p)}
+									></button>
+								{/each}
+							</div>
+						</div>
+						<label class="field">
+							Block
+							<input type="range" min="1" max="25" bind:value={blockNo} onchange={setBlock} />
+							<span class="value">{blockNo}{blockNo <= 5 ? ', double' : ', single'}</span>
+						</label>
+						<div class="field steps">
+							<span>Step</span>
+							<div class="seg" role="group" aria-label="The step kept in full">
+								{#each Array.from({ length: steps }, (_, i) => i + 1) as s (s)}
+									<button type="button" aria-pressed={s === paintStep} onclick={() => setStep(s)}
+										>{s}</button
+									>
+								{/each}
+							</div>
 						</div>
 					</div>
-					<label>
-						Block
-						<input type="range" min="1" max="25" bind:value={blockNo} onchange={setBlock} />
-						<span class="num">{blockNo}{blockNo <= 5 ? ', double' : ', single'}</span>
-					</label>
-					<div class="steps" role="group" aria-label="The step kept in full">
-						<span>Step</span>
-						{#each Array.from({ length: steps }, (_, i) => i + 1) as s (s)}
-							<button type="button" class:on={s === paintStep} onclick={() => setStep(s)}
-								>{s}</button
-							>
-						{/each}
-					</div>
-				</div>
-			{/if}
+				{/if}
+			</div>
 		</form>
 		<ol class="stations" aria-label="The steps of the layer">
 			{#each stations as s, i (i)}
 				<li>
-					<button type="button" class:on={i === station} onclick={() => go(i)}>{s}</button>
+					<button
+						type="button"
+						aria-current={i === station ? 'step' : undefined}
+						onclick={() => go(i)}><span class="n">{i + 1}</span>{s}</button
+					>
 				</li>
 			{/each}
 		</ol>
-		<div class="bottom">
-			<p class="caption" aria-live="polite">
-				{painterNote && mode === 'painter' ? painterNote : busy ? `${busy}…` : caption}
-			</p>
+		<div class="lab-bottom">
+			<div class="glass lab-narrator">
+				{#if stations.length}<p class="where">
+						<span class="n">{station + 1} of {stations.length}</span>{stations[station]}
+					</p>{/if}
+				<p class="narration" aria-live="polite">
+					{painterNote && mode === 'painter' ? painterNote : busy ? `${busy}…` : caption}
+				</p>
+			</div>
 			<div class="step">
-				<button type="button" onclick={() => go(station - 1)} aria-label="Previous step">←</button>
 				<button
 					type="button"
+					class="btn icon"
+					onclick={() => go(station - 1)}
+					aria-label="Previous step"
+					title="Previous step (←)"><ChevronLeft /></button
+				>
+				<button
+					type="button"
+					class="btn icon"
+					aria-label={playing ? 'Pause' : 'Play'}
+					title={playing ? 'Pause (space)' : 'Play (space)'}
 					onclick={() => {
 						const s = scene();
 						if (s) s.playing = !s.playing;
-					}}>{playing ? 'Pause' : 'Play'}</button
+					}}
 				>
-				<button type="button" onclick={() => go(station + 1)} aria-label="Next step">→</button>
+					{#if playing}<Pause />{:else}<Play />{/if}
+				</button>
+				<button
+					type="button"
+					class="btn icon"
+					onclick={() => go(station + 1)}
+					aria-label="Next step"
+					title="Next step (→)"><ChevronRight /></button
+				>
 			</div>
 		</div>
 	{/if}
 	{#if tip}
-		<div class="tip" style:left="{tip.x + 16}px" style:top="{tip.y + 16}px">
+		<div class="tip glass" style:left="{tip.x + 16}px" style:top="{tip.y + 16}px">
 			<strong>{tip.title}</strong>
 			{#each tip.lines as line, i (i)}
 				<span>{line}</span>
@@ -351,134 +407,20 @@
 </main>
 
 <style>
-	main {
-		position: fixed;
-		inset: 0;
-		background: var(--void);
-	}
-	canvas {
-		position: absolute;
-		inset: 0;
-		width: 100%;
-		height: 100%;
-		touch-action: none;
-		cursor: grab;
-	}
-	canvas:active {
-		cursor: grabbing;
-	}
-	.labels span {
-		position: absolute;
-		color: var(--bone);
-		white-space: nowrap;
-		pointer-events: none;
-		font-weight: 300;
-		transform: translate(-50%, -50%);
-	}
-	.labels span.left {
-		transform: translate(0, -50%);
-	}
-	.labels span.right {
-		transform: translate(-100%, -50%);
-	}
-	.labels span.italic {
-		font-style: italic;
-	}
-	form {
-		position: absolute;
-		left: 2.2rem;
-		top: 3.2rem;
-		width: min(40rem, 60vw);
-	}
-	textarea {
-		display: block;
-		width: 100%;
-		max-height: 20vh;
-		field-sizing: content;
-		resize: none;
-		background: none;
-		border: none;
-		border-bottom: 1px solid rgb(232 226 214 / 0.2);
-		color: var(--bone);
-		font: italic 300 clamp(1.05rem, 1.5vw, 1.6rem) / 1.3 var(--serif);
-		padding: 0.3rem 0;
-		outline: none;
-	}
-	textarea:focus-visible {
-		border-bottom-color: var(--ember);
-	}
-	.modes {
-		display: flex;
-		margin-top: 0.7rem;
-	}
-	.modes button + button {
-		border-left: none;
-	}
-	.modes button.on {
-		border-color: var(--ember);
-		color: var(--bone);
-		opacity: 1;
-	}
-	.modes button {
-		opacity: 0.6;
-	}
-	.words {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.3rem 0.5rem;
-		margin-top: 0.6rem;
-	}
-	.words button {
-		background: none;
-		border: none;
-		border-bottom: 1px solid transparent;
-		color: var(--bone);
-		opacity: 0.5;
-		font: inherit;
-		font-size: 0.9rem;
-		padding: 0.05rem 0.1rem;
-		cursor: pointer;
-	}
-	.words button.on {
-		opacity: 1;
-		border-bottom-color: var(--ember);
-	}
-	.options {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.8rem 1.4rem;
-		margin-top: 0.8rem;
-		font-size: 0.82rem;
-	}
-	.options label {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		opacity: 0.8;
-	}
-	.num {
-		font-variant-numeric: tabular-nums;
-		min-width: 1.5rem;
-	}
-	input[type='range'] {
-		accent-color: var(--ember);
-		width: 10rem;
+	.lab-ask {
+		width: min(40rem, calc(100% - 2 * var(--gutter) - 14rem));
 	}
 	.patches {
 		display: flex;
 		align-items: center;
-		gap: 0.5rem;
-	}
-	.hint {
-		opacity: 0.6;
-		font-style: italic;
+		gap: 0.6rem;
 	}
 	.grid {
 		position: relative;
 		width: 3.4rem;
 		height: 3.4rem;
-		border: 1px solid rgb(232 226 214 / 0.25);
+		border: 1px solid var(--hair-2);
+		border-radius: 4px;
 	}
 	.grid button {
 		position: absolute;
@@ -486,138 +428,94 @@
 		height: 0.62rem;
 		padding: 0;
 		border-radius: 50%;
-		border: 1px solid rgb(232 226 214 / 0.55);
+		border: 1px solid rgb(236 229 216 / 0.55);
 		background: none;
+		cursor: pointer;
 		transform: translate(-50%, -50%);
 	}
 	.grid button.on {
 		background: var(--ember);
 		border-color: var(--ember);
 	}
-	.steps {
-		display: flex;
-		align-items: center;
-		gap: 0.3rem;
-	}
-	.steps span {
-		opacity: 0.8;
-		margin-right: 0.2rem;
-	}
-	.steps button {
-		padding: 0.15rem 0.5rem;
-		opacity: 0.6;
-	}
-	.steps button.on {
-		opacity: 1;
-		border-color: var(--ember);
+	.steps .seg button {
+		padding: 0 0.7rem;
 	}
 	.stations {
 		position: absolute;
-		right: 1.4rem;
-		top: 4.2rem;
+		right: calc(var(--gutter) - 0.5rem);
+		top: var(--top);
 		margin: 0;
 		padding: 0;
 		list-style: none;
-		counter-reset: st;
 		display: flex;
 		flex-direction: column;
-		gap: 0.15rem;
-		font-size: 0.82rem;
-	}
-	.stations li {
-		counter-increment: st;
-		text-align: right;
+		gap: 1px;
 	}
 	.stations button {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		width: 100%;
+		padding: 0.3rem 0.6rem;
+		border: 0;
+		border-radius: var(--r-sm);
 		background: none;
-		border: none;
-		color: var(--bone);
-		opacity: 0.4;
-		font: inherit;
-		padding: 0.1rem 0;
+		color: var(--bone-3);
+		font: 400 var(--t-sm) / 1.2 var(--sans);
+		text-align: left;
 		cursor: pointer;
 	}
-	.stations button::after {
-		content: ' ' counter(st);
-		font-variant-numeric: tabular-nums;
-		display: inline-block;
-		width: 1.6rem;
-		opacity: 0.6;
+	.stations button:hover {
+		color: var(--bone);
+		background: var(--wash);
 	}
-	.stations button.on {
-		opacity: 1;
+	.stations .n,
+	.where .n {
+		min-width: 1.2rem;
+		color: var(--bone-3);
+		font-variant-numeric: tabular-nums;
+		text-align: right;
+	}
+	.stations button[aria-current='step'] {
+		color: var(--bone);
+		background: var(--ember-wash);
+	}
+	.stations button[aria-current='step'] .n {
 		color: var(--ember);
 	}
-	.bottom {
-		position: absolute;
-		left: 2.2rem;
-		right: 2.2rem;
-		bottom: 1.8rem;
-		display: flex;
-		align-items: flex-end;
-		justify-content: space-between;
-		gap: 2rem;
+	.where {
+		display: none;
+		gap: 0.5rem;
+		margin: 0 0 0.35rem;
+		color: var(--bone-2);
+		font: 500 var(--t-xs) / 1.3 var(--sans);
 	}
-	.caption,
-	.note {
-		max-width: 68ch;
-		margin: 0;
-		font-weight: 300;
-		line-height: 1.5;
-		color: var(--bone);
-		opacity: 0.82;
-	}
-	.note {
-		position: absolute;
-		left: 2.2rem;
-		bottom: 2rem;
+	.where .n {
+		min-width: 0;
+		text-align: left;
 	}
 	.step {
 		display: flex;
 		gap: 0.4rem;
 		flex-shrink: 0;
 	}
-	button {
-		background: none;
-		border: 1px solid rgb(232 226 214 / 0.3);
-		color: var(--bone);
-		font: inherit;
-		font-size: 0.82rem;
-		padding: 0.25rem 0.7rem;
-		cursor: pointer;
+	@media (max-width: 900px) {
+		.lab-ask {
+			width: calc(100% - 2 * var(--gutter));
+		}
+		.stations {
+			display: none;
+		}
+		.where {
+			display: flex;
+		}
 	}
-	button:focus-visible,
-	input:focus-visible {
-		outline: 1px solid var(--ember);
-		outline-offset: 2px;
-	}
-	.bar {
-		height: 1px;
-		width: min(28rem, 60vw);
-		margin-top: 0.8rem;
-		background: rgb(232 226 214 / 0.15);
-	}
-	.bar span {
-		display: block;
-		height: 100%;
-		background: var(--ember);
-		transform-origin: left;
-	}
-	.tip {
-		position: absolute;
-		z-index: 10;
-		display: flex;
-		flex-direction: column;
-		gap: 0.15rem;
-		padding: 0.55rem 0.75rem;
-		background: rgb(10 10 10 / 0.88);
-		border: 1px solid rgb(232 226 214 / 0.18);
-		color: var(--bone);
-		font-size: 0.82rem;
-		pointer-events: none;
-	}
-	.tip strong {
-		font-weight: 400;
-		color: var(--ember);
+	@media (max-width: 720px) {
+		.step {
+			justify-content: center;
+		}
+		.seg .long {
+			display: none;
+		}
 	}
 </style>

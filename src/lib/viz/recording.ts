@@ -4,7 +4,8 @@
 // stored as f16, the painter's pictures as WebP, and the painter's events keep the times they happened at.
 //
 // Files: recording.json (everything but the numbers and pictures), recording.bin (the numbers, f16, in the order
-// listed in the JSON), and one .webp per picture.
+// listed in the JSON), one .webp per stage of each pass and for the finished picture, and blocks.webp: the picture
+// each block had in mind, 25 to a row, one row per pass.
 
 /** What the reader's pass left, as the threads piece uses it (see Threads.gather). */
 export interface ReaderTrace {
@@ -25,6 +26,7 @@ export interface ReaderTrace {
 export type PaintEvent =
 	| { t: number; kind: 'encoded'; v: number }
 	| { t: number; kind: 'block'; s: number; b: number; attn: Float32Array; words: Float32Array }
+	| { t: number; kind: 'picture'; s: number; b: number; image: Blob | ImageBitmap } // what block b has in mind
 	| { t: number; kind: 'stage'; s: number; res: number; image: Blob }
 	| { t: number; kind: 'final'; image: Blob };
 
@@ -72,7 +74,7 @@ function fromHalf(h: number) {
 // ---- writing
 
 /** The recording as files: { name: contents }. */
-export function pack(rec: Recording): Record<string, Blob | string> {
+export async function pack(rec: Recording): Promise<Record<string, Blob | string>> {
 	const arrays: Float32Array[] = [];
 	const add = (a: Float32Array) => (arrays.push(a), a.length);
 	const r = rec.reader;
@@ -83,8 +85,19 @@ export function pack(rec: Recording): Record<string, Blob | string> {
 	r.e.forEach(add);
 	add(r.proj);
 	const files: Record<string, Blob | string> = {};
+	// the blocks' pictures on one sheet
+	const pictures = rec.paint.filter((e) => e.kind === 'picture');
+	if (pictures.length) {
+		const bitmaps = await Promise.all(pictures.map((e) => createImageBitmap(e.image)));
+		const S = bitmaps[0].width;
+		const sheet = new OffscreenCanvas(25 * S, rec.steps * S);
+		const ctx = sheet.getContext('2d')!;
+		pictures.forEach((e, i) => ctx.drawImage(bitmaps[i], e.b * S, e.s * S));
+		files['blocks.webp'] = await sheet.convertToBlob({ type: 'image/webp', quality: 0.9 });
+	}
 	const paint = rec.paint.map((e) => {
 		if (e.kind === 'block') return { ...e, attn: add(e.attn), words: add(e.words) };
+		if (e.kind === 'picture') return { t: e.t, kind: e.kind, s: e.s, b: e.b };
 		if (e.kind === 'stage' || e.kind === 'final') {
 			const name = e.kind === 'final' ? 'final.webp' : `pass${e.s + 1}-${e.res}.webp`;
 			files[name] = e.image;
@@ -98,7 +111,7 @@ export function pack(rec: Recording): Record<string, Blob | string> {
 	for (const a of arrays) for (let i = 0; i < a.length; i++) half[o++] = toHalf(a[i]);
 	files['recording.bin'] = new Blob([half.buffer]);
 	files['recording.json'] = JSON.stringify({
-		version: 1,
+		version: 2,
 		prompt: rec.prompt,
 		seed: rec.seed,
 		steps: rec.steps,
@@ -130,6 +143,7 @@ interface Stored {
 	paint: (
 		| { t: number; kind: 'encoded'; v: number }
 		| { t: number; kind: 'block'; s: number; b: number; attn: number; words: number }
+		| { t: number; kind: 'picture'; s: number; b: number }
 		| { t: number; kind: 'stage'; s: number; res: number; image: string }
 		| { t: number; kind: 'final'; image: string }
 	)[];
@@ -163,9 +177,18 @@ export async function load(base: string): Promise<Recording> {
 	const probs = Array.from({ length: NL }, () => Array.from({ length: H }, () => take(nw * m.N)));
 	const e: [Float32Array, Float32Array] = [take(D), take(D)];
 	const proj = take(NL * (F + H * HD) * 2);
+	// the blocks' pictures (a recording from before they were kept has none)
+	const sheet = meta.paint.some((ev) => ev.kind === 'picture')
+		? await get('blocks.webp')
+				.then((r) => r.arrayBuffer())
+				.then((b) => createImageBitmap(new Blob([b], { type: 'image/webp' })))
+		: null;
+	const S = sheet ? sheet.width / 25 : 0;
 	const paint = await Promise.all(
 		meta.paint.map(async (ev): Promise<PaintEvent> => {
 			if (ev.kind === 'block') return { ...ev, attn: take(ev.attn), words: take(ev.words) };
+			if (ev.kind === 'picture')
+				return { ...ev, image: await createImageBitmap(sheet!, ev.b * S, ev.s * S, S, S) };
 			if (ev.kind === 'stage' || ev.kind === 'final')
 				return {
 					...ev,

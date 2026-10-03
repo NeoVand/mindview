@@ -3,7 +3,7 @@
 	// until the visitor starts it. The prompt it opens with plays a recording of a real run (no download, see
 	// recording.ts); any other prompt downloads the model and runs live. The prompt can be changed at any time (Enter).
 	// ?record (in development): run the opening prompt live and keep the run, for research/scripts/record_threads.mjs.
-	import { asset, resolve } from '$app/paths';
+	import { asset } from '$app/paths';
 	import { page } from '$app/state';
 	import { ensureFonts } from '$lib/engine/text';
 	import type { GPU } from '$lib/engine/gpu';
@@ -11,6 +11,15 @@
 	import { TURBO, turboPainter, turboReader, type TurboProgress } from '$lib/landing/turbo';
 	import { load, pack, type Recording } from '$lib/viz/recording';
 	import { Threads, type ThreadsStatus } from '$lib/viz/threads';
+	import Journey from '$lib/ui/Journey.svelte';
+	import Status from '$lib/ui/Status.svelte';
+	import NeedsComputer from '$lib/ui/NeedsComputer.svelte';
+	import { mayLoad } from '$lib/lab/device';
+	import { attachOrbit } from '$lib/ui/gestures';
+	import Play from '@lucide/svelte/icons/play';
+	import CirclePlay from '@lucide/svelte/icons/circle-play';
+	import HardDriveDownload from '@lucide/svelte/icons/hard-drive-download';
+	import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
 
 	const RECORDED = {
 		prompt: 'a bonsai tree made of glowing circuitry in a dark museum, volumetric light',
@@ -28,6 +37,7 @@
 	let shown = $state(''); // the prompt on screen
 	let live = $state(false); // the reader is loaded
 	let error = $state<string | null>(null);
+	let blocked = $state<{ why: string; go: () => void } | null>(null); // a live run may not fit here
 	let loading = $state('');
 	let progress = $state(0);
 	let painterNote = $state('');
@@ -38,7 +48,7 @@
 	let marks = $state<number[]>([]);
 	let mode = $state('live');
 	let done = $state(false);
-	let scrubbing = false;
+	let paused = $state(false);
 	let mounted = $state(false); // the canvas is in the page (the button waits for it)
 	const mb = (x: number) => Math.round(x).toLocaleString();
 	const recorded = $derived(!record && prompt.trim() === RECORDED.prompt);
@@ -65,34 +75,9 @@
 	function mount(c: HTMLCanvasElement) {
 		canvas = c;
 		mounted = true;
-		let drag: { x: number; y: number; id: number } | null = null;
-		const down = (e: PointerEvent) => {
-			drag = { x: e.clientX, y: e.clientY, id: e.pointerId };
-			c.setPointerCapture(e.pointerId);
-		};
-		const move = (e: PointerEvent) => {
-			if (!drag || !study || e.pointerId !== drag.id) return;
-			study.orbit(e.clientX - drag.x, e.clientY - drag.y);
-			drag.x = e.clientX;
-			drag.y = e.clientY;
-		};
-		const up = () => (drag = null);
-		const wheel = (e: WheelEvent) => {
-			if (!study) return;
-			e.preventDefault();
-			study.zoom(Math.exp(e.deltaY * 0.0015));
-		};
-		c.addEventListener('pointerdown', down);
-		c.addEventListener('pointermove', move);
-		c.addEventListener('pointerup', up);
-		c.addEventListener('pointercancel', up);
-		c.addEventListener('wheel', wheel, { passive: false });
+		const detach = attachOrbit(c, () => study);
 		return () => {
-			c.removeEventListener('pointerdown', down);
-			c.removeEventListener('pointermove', move);
-			c.removeEventListener('pointerup', up);
-			c.removeEventListener('pointercancel', up);
-			c.removeEventListener('wheel', wheel);
+			detach();
 			study?.destroy();
 			study = undefined;
 		};
@@ -112,7 +97,7 @@
 					const rec = study?.recording;
 					if (!rec) return null;
 					const out: Record<string, string> = {};
-					for (const [name, f] of Object.entries(pack(rec))) {
+					for (const [name, f] of Object.entries(await pack(rec))) {
 						const bytes = new Uint8Array(
 							typeof f === 'string' ? new TextEncoder().encode(f) : await f.arrayBuffer()
 						);
@@ -147,8 +132,14 @@
 				stage = 'journey';
 				playing = true;
 				shown = text;
+				s.paused = paused = false;
 				await s.play(rec);
 				return;
+			}
+			if (!live) {
+				// a live run keeps about 2.8 GB on the GPU: on a phone, ask first
+				await mayLoad(2.8, 890, (why, go) => (blocked = { why, go }));
+				blocked = null;
 			}
 			const s = await piece();
 			if (!live) {
@@ -171,6 +162,7 @@
 			stage = 'journey';
 			playing = false;
 			shown = text;
+			s.paused = paused = false;
 			await s.read(text);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -190,16 +182,17 @@
 		}
 	}
 
-	function scrub(e: PointerEvent) {
-		const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		study?.rideTo(((e.clientX - box.left) / box.width) * total);
+	function togglePause() {
+		if (!study) return;
+		study.paused = !study.paused;
+		paused = study.paused;
 	}
 
 	function onkeydown(e: KeyboardEvent) {
 		const tag = (e.target as HTMLElement)?.tagName;
 		if (!study || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
 		if (e.key === ' ') {
-			study.paused = !study.paused;
+			togglePause();
 			e.preventDefault();
 		}
 	}
@@ -217,14 +210,10 @@
 <main class:intro={stage === 'intro'}>
 	<canvas
 		{@attach mount}
-		aria-label="Your words as threads through the reader's layers, then the painter; drag to turn, scroll to zoom"
+		aria-label="Your words as threads through the reader's layers, then the painter; drag to turn, scroll or pinch to zoom"
 	></canvas>
-	<nav class="elsewhere" aria-label="Elsewhere">
-		<a href={resolve('/paint')}>Paint with it</a>
-		<a href={resolve('/lab')}>The labs: the models live, every number</a>
-	</nav>
 
-	<form onsubmit={submit} class:start={stage === 'intro'}>
+	<form onsubmit={submit} class="ask" class:start={stage === 'intro'}>
 		{#if stage === 'intro'}
 			<p class="lede">
 				Type something. A language model reads it, a diffusion model paints it, here in this tab,
@@ -232,6 +221,7 @@
 			</p>
 		{/if}
 		<textarea
+			class="prompt"
 			bind:value={prompt}
 			onkeydown={promptKey}
 			rows="1"
@@ -239,75 +229,79 @@
 			spellcheck="false"></textarea>
 		{#if stage === 'intro'}
 			<div class="go">
-				<button type="submit" disabled={!mounted || !prompt.trim()}>Read and paint</button>
-				<span class="size"
-					>{recorded
-						? 'This prompt plays a recording of a real run. Change the words to run the models here, on your graphics card: about 1.2 GB, downloaded once and kept by your browser.'
-						: 'The models are about 1.2 GB, downloaded once and kept by your browser. They run here, on your graphics card.'}</span
-				>
+				<button type="submit" class="btn primary lg" disabled={!mounted || !prompt.trim()}>
+					<Play />Read and paint
+				</button>
+				<p class="hint">
+					{#if recorded}
+						<CirclePlay />
+						<span
+							>This prompt plays a recording of a real run, at once. Change the words to run the
+							models here instead: about 1.2 GB, downloaded once and kept by your browser.</span
+						>
+					{:else}
+						<HardDriveDownload />
+						<span
+							>The models run here, on your graphics card. They are about 1.2 GB, downloaded once
+							and kept by your browser.</span
+						>
+					{/if}
+				</p>
 			</div>
 		{:else if stage === 'journey'}
 			{#if prompt.trim() && prompt.trim() !== shown}
-				<p class="under">
-					Enter to read and paint this{live
-						? ''
-						: ', live: the models download first (about 1.2 GB)'}.
+				<p class="hint under">
+					<CornerDownLeft />
+					<span
+						>Enter to read and paint this{live
+							? ''
+							: ', live: the models download first (about 1.2 GB)'}.</span
+					>
 				</p>
-			{:else if painterNote}
-				<p class="under">{painterNote}</p>
 			{:else if playing}
-				<p class="under">A recording of a real run. Change the words to run it live, here.</p>
+				<p class="hint under">
+					<CirclePlay /><span
+						>A recording of a real run. Change the words to run it live, here.</span
+					>
+				</p>
 			{/if}
 		{/if}
 	</form>
 
-	{#if error}
-		<p class="note" role="alert">{error}</p>
+	{#if blocked}
+		<NeedsComputer
+			why={blocked.why}
+			ontry={blocked.go}
+			recorded={() => {
+				blocked = null;
+				prompt = RECORDED.prompt;
+				begin();
+			}}
+		/>
+	{:else if error}
+		<Status text={error} error />
 	{:else if stage === 'loading'}
-		<div class="note">
-			<p>{loading}</p>
-			<div class="bar"><span style:transform="scaleX({progress})"></span></div>
-		</div>
+		<Status text={loading} {progress} />
 	{:else if stage === 'journey'}
-		<p class="caption" aria-live="polite">{status?.caption ?? ''}</p>
-
-		<div class="journey">
-			<div
-				class="track"
-				role="slider"
-				tabindex="0"
-				aria-label="Where you are along the computation"
-				aria-valuemin={0}
-				aria-valuemax={total}
-				aria-valuenow={Math.round(ride)}
-				onpointerdown={(e) => {
-					scrubbing = true;
-					(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-					scrub(e);
-				}}
-				onpointermove={(e) => scrubbing && scrub(e)}
-				onpointerup={() => (scrubbing = false)}
-				onpointercancel={() => (scrubbing = false)}
-			>
-				<span class="done" style:transform="scaleX({front / total})"></span>
-				{#each marks as m, i (i)}
-					<span class="tick" style:left="{(m / total) * 100}%"></span>
-				{/each}
-				<span class="here" style:left="{(ride / total) * 100}%"></span>
-			</div>
-			{#if mode !== 'live'}
-				{#if front < total - 0.01}
-					<button onclick={() => study?.follow()}>Ride along again</button>
-				{:else}
-					{#if mode !== 'rewind'}<button onclick={() => study?.rideBack()}>Ride back</button>{/if}
-					{#if mode !== 'overview'}<button onclick={() => study?.follow()}>See it whole</button
-						>{/if}
-					{#if mode !== 'finale' && done}<button onclick={() => study?.showPicture()}
-							>The picture</button
-						>{/if}
-				{/if}
-			{/if}
-		</div>
+		<Journey
+			caption={status?.caption ?? ''}
+			{front}
+			{ride}
+			{total}
+			{marks}
+			{mode}
+			{done}
+			{paused}
+			onscrub={(at) => study?.rideTo(at)}
+			onpause={togglePause}
+			onfollow={() => study?.follow()}
+			onrideback={() => study?.rideBack()}
+			onpicture={() => study?.showPicture()}
+		>
+			{#snippet note()}
+				{#if painterNote}<p class="hint">{painterNote}</p>{/if}
+			{/snippet}
+		</Journey>
 	{/if}
 </main>
 
@@ -328,194 +322,71 @@
 	canvas:active {
 		cursor: grabbing;
 	}
-	form {
+	.ask {
 		position: absolute;
-		left: 6vw;
-		top: 5vh;
-		width: min(46rem, 88vw);
+		left: var(--gutter);
+		top: var(--top);
+		width: min(44rem, calc(100% - 2 * var(--gutter)));
+		--prompt-size: clamp(1.15rem, 1.8vw, 1.6rem);
 		transition:
 			top 0.8s ease,
 			transform 0.8s ease;
 	}
-	form.start {
+	.ask.start {
 		top: 50%;
-		transform: translateY(-60%);
+		width: min(50rem, calc(100% - 2 * var(--gutter)));
+		transform: translateY(-55%);
+		--prompt-size: clamp(1.9rem, 4.4vw, 3.5rem);
 	}
 	.lede {
-		margin: 0 0 1.4rem;
+		margin: 0 0 1.6rem;
 		max-width: 34rem;
-		font-weight: 300;
-		font-size: clamp(1rem, 1.3vw, 1.15rem);
-		line-height: 1.5;
-		color: var(--bone);
-		opacity: 0.7;
-	}
-	textarea {
-		display: block;
-		width: 100%;
-		max-height: 30vh;
-		field-sizing: content;
-		resize: none;
-		overflow-y: auto;
-		background: none;
-		border: none;
-		border-bottom: 1px solid rgb(232 226 214 / 0.2);
-		color: var(--bone);
-		font: italic 300 clamp(1.2rem, 1.8vw, 2rem) / 1.3 var(--serif);
-		padding: 0.3rem 0;
-		outline: none;
-	}
-	form.start textarea {
-		font-size: clamp(1.6rem, 3.2vw, 3rem);
-	}
-	textarea:focus-visible {
-		border-bottom-color: var(--ember);
+		color: var(--bone-2);
+		font: 300 clamp(1.1rem, 1.5vw, 1.3rem) / 1.5 var(--serif);
+		text-wrap: pretty;
 	}
 	.go {
 		display: flex;
 		flex-wrap: wrap;
-		align-items: center;
-		gap: 1.2rem 1.6rem;
-		margin-top: 1.6rem;
+		align-items: flex-start;
+		gap: 1rem 1.5rem;
+		margin-top: 1.8rem;
 	}
-	.go button {
-		font-size: 1.05rem;
-		padding: 0.55rem 1.3rem;
-		border-color: var(--ember);
-	}
-	.size {
-		max-width: 26rem;
-		font-size: 0.85rem;
-		line-height: 1.45;
-		color: var(--bone);
-		opacity: 0.5;
-	}
-	.caption,
-	.note {
-		position: absolute;
-		left: 6vw;
-		bottom: calc(5vh + 2.5rem);
-		max-width: 62ch;
+	.hint {
+		display: flex;
+		gap: 0.55rem;
 		margin: 0;
-		font-weight: 300;
-		line-height: 1.45;
-		color: var(--bone);
-		opacity: 0.75;
-		pointer-events: none;
+		max-width: 27rem;
 	}
-	.under {
-		margin: 0.6rem 0 0;
-		font-size: 0.85rem;
-		line-height: 1.45;
-		color: var(--bone);
-		opacity: 0.5;
+	.hint :global(svg) {
+		flex: none;
+		width: 1rem;
+		height: 1rem;
+		margin-top: 0.12rem;
+		color: var(--bone-3);
 	}
-	.elsewhere {
-		position: absolute;
-		top: 1.1rem;
-		right: 1.4rem;
-		z-index: 2;
-		display: flex;
-		gap: 1.1rem;
+	.go .hint {
+		padding-top: 0.2rem;
 	}
-	.elsewhere a {
-		font-size: 0.82rem;
-		letter-spacing: 0.01em;
-		color: var(--bone);
-		opacity: 0.55;
-		text-decoration: none;
-		border-bottom: 1px solid transparent;
+	.hint.under {
+		margin-top: 0.6rem;
+		max-width: none;
 	}
-	.elsewhere a:hover,
-	.elsewhere a:focus-visible {
-		opacity: 1;
-		border-bottom-color: var(--ember);
-		outline: none;
-	}
-	.journey {
-		position: absolute;
-		left: 6vw;
-		right: 6vw;
-		bottom: 5vh;
-		display: flex;
-		align-items: center;
-		gap: 1.5rem;
-	}
-	.track {
-		position: relative;
-		flex: 1;
-		height: 1.6rem;
-		cursor: ew-resize;
-		touch-action: none;
-	}
-	.track:focus-visible {
-		outline: 1px solid var(--ember);
-		outline-offset: 4px;
-	}
-	.track::before {
-		content: '';
-		position: absolute;
-		left: 0;
-		right: 0;
-		top: 50%;
-		height: 1px;
-		background: rgb(232 226 214 / 0.15);
-	}
-	.done {
-		position: absolute;
-		left: 0;
-		right: 0;
-		top: 50%;
-		height: 1px;
-		background: rgb(232 226 214 / 0.55);
-		transform-origin: left;
-	}
-	.tick {
-		position: absolute;
-		top: calc(50% - 3px);
-		width: 1px;
-		height: 6px;
-		background: rgb(232 226 214 / 0.25);
-	}
-	.here {
-		position: absolute;
-		top: 50%;
-		width: 9px;
-		height: 9px;
-		margin: -4.5px 0 0 -4.5px;
-		border-radius: 50%;
-		background: var(--ember);
-	}
-	button {
-		background: none;
-		border: 1px solid rgb(232 226 214 / 0.3);
-		color: var(--bone);
-		font: inherit;
-		font-size: 0.9rem;
-		padding: 0.3rem 0.8rem;
-		cursor: pointer;
-	}
-	button:disabled {
-		opacity: 0.4;
-		cursor: default;
-	}
-	button:focus-visible {
-		outline: 1px solid var(--ember);
-	}
-	.bar {
-		height: 1px;
-		width: min(28rem, 60vw);
-		margin-top: 0.8rem;
-		background: rgb(232 226 214 / 0.15);
-	}
-	.bar span {
-		display: block;
-		height: 100%;
-		background: var(--ember);
-		transform-origin: left;
+	@media (max-width: 720px) {
+		.ask.start {
+			top: auto;
+			bottom: max(1.5rem, env(safe-area-inset-bottom));
+			transform: none;
+		}
+		.ask.start .lede {
+			margin-bottom: 1.2rem;
+		}
+		.go .btn {
+			width: 100%;
+		}
 	}
 	@media (prefers-reduced-motion: reduce) {
-		form {
+		.ask {
 			transition: none;
 		}
 	}

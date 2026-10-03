@@ -11,10 +11,4 @@
 	/>
 </svelte:head>
 
-<Paint
-	elsewhere={[
-		{ href: resolve('/'), label: 'The first piece' },
-		{ href: resolve('/lab'), label: 'The labs' }
-	]}
-	compute={{ href: resolve('/lab'), label: 'See it compute, in the labs' }}
-/>
+<Paint compute={{ href: resolve('/lab'), label: 'See it compute, in the labs' }} />

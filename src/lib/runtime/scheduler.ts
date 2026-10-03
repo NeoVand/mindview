@@ -96,6 +96,7 @@ export class GpuScheduler {
 	private sub = 0;
 	private lastPump = 0;
 	private interval = 16.7; // smoothed time between frames
+	private recent: number[] = []; // the last frames' times, to find the pace the page keeps without our work
 	private callbacks: Promise<void> = Promise.resolve();
 	/** Milliseconds of GPU work done so far in this run (estimate). */
 	spent = 0;
@@ -106,6 +107,11 @@ export class GpuScheduler {
 
 	get generation() {
 		return this.gen;
+	}
+
+	/** The time between frames, smoothed (ms). */
+	get frameMs() {
+		return this.interval;
 	}
 
 	get pending() {
@@ -139,11 +145,16 @@ export class GpuScheduler {
 		const frame = this.lastPump ? Math.min(100, now - this.lastPump) : 16.7;
 		this.lastPump = now;
 		this.interval += (frame - this.interval) * 0.25;
+		this.recent.push(frame);
+		if (this.recent.length > 90) this.recent.shift();
 		if (!this.queue.length) return;
 		// find the most work per frame that keeps frames on time: a little more after every frame that came on time, a
-		// good deal less after one that came late (display frames are 16.7 ms apart; a late one shows as 33)
-		if (frame > 24) this.budget = Math.max(this.floor, this.budget * 0.8);
-		else this.budget = Math.min(40, Math.max(this.floor, this.budget + 0.15));
+		// good deal less after one that came late. On time is the pace the page keeps anyway: display frames are 16.7
+		// ms apart, but a heavy scene may draw only every second one (33 ms), and then a 33 ms frame is not our doing.
+		// The fastest recent frame tells that pace (it comes back each time the work is cut).
+		const pace = Math.max(6, Math.min(...this.recent));
+		if (frame > Math.max(24, pace * 1.35)) this.budget = Math.max(this.floor, this.budget * 0.8);
+		else this.budget = Math.min(40, Math.max(this.floor, this.budget * 1.02 + 0.15));
 		if (this.inflight >= IN_FLIGHT) return;
 		const gen = this.gen;
 		const sub = ++this.sub;

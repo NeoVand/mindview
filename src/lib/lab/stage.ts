@@ -23,7 +23,7 @@ export interface View {
 	pitch: number;
 }
 
-const FOV = (38 * Math.PI) / 180;
+const FOV = (38 * Math.PI) / 180; // on a landscape screen; see Stage.fov
 
 export class Stage {
 	readonly device: GPUDevice;
@@ -102,10 +102,36 @@ export class Stage {
 		this.view = { ...this.want, target: [...this.want.target] as V3 };
 	}
 
-	/** Pointer controls on the canvas; returns a function that removes them. */
+	/** The vertical field of view: FOV on a landscape screen, wider on a narrow one (a phone held upright) so that
+	 * the same width fits. */
+	get fov() {
+		const c = this.gpu.canvas;
+		const aspect = c.clientWidth / Math.max(1, c.clientHeight);
+		return 2 * Math.atan(Math.tan(FOV / 2) * Math.max(1, Math.pow(1.45 / aspect, 0.85)));
+	}
+
+	/**
+	 * Pointer controls on the canvas: drag to turn, right-drag (or shift) to move, scroll to come closer; on a touch
+	 * screen, two fingers pinch to come closer and move together to move. Returns a function that removes them.
+	 */
 	attachControls(canvas: HTMLCanvasElement, onClick?: (x: number, y: number) => void) {
 		let drag: { x: number; y: number; id: number; pan: boolean; moved: number } | null = null;
+		const touches = new Map<number, { x: number; y: number }>();
+		let pinch: { d: number; x: number; y: number } | null = null;
+		const pair = () => {
+			const [a, b] = [...touches.values()];
+			return { d: Math.hypot(a.x - b.x, a.y - b.y), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+		};
 		const down = (e: PointerEvent) => {
+			canvas.setPointerCapture(e.pointerId);
+			if (e.pointerType === 'touch') {
+				touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+				if (touches.size === 2) {
+					pinch = pair();
+					drag = null; // a second finger turns a turn into a pinch
+					return;
+				}
+			}
 			drag = {
 				x: e.clientX,
 				y: e.clientY,
@@ -113,9 +139,20 @@ export class Stage {
 				pan: e.button === 2 || e.shiftKey,
 				moved: 0
 			};
-			canvas.setPointerCapture(e.pointerId);
 		};
 		const move = (e: PointerEvent) => {
+			const t = touches.get(e.pointerId);
+			if (t) {
+				t.x = e.clientX;
+				t.y = e.clientY;
+			}
+			if (pinch && touches.size === 2) {
+				const p = pair();
+				if (p.d > 0 && pinch.d > 0) this.zoomAt(p.x, p.y, pinch.d / p.d);
+				this.pan(p.x - pinch.x, p.y - pinch.y);
+				pinch = p;
+				return;
+			}
 			if (!drag || e.pointerId !== drag.id) return;
 			const dx = e.clientX - drag.x,
 				dy = e.clientY - drag.y;
@@ -126,8 +163,12 @@ export class Stage {
 			else this.orbit(dx, dy);
 		};
 		const up = (e: PointerEvent) => {
-			if (drag && drag.moved < 4 && onClick) onClick(e.clientX, e.clientY);
-			drag = null;
+			touches.delete(e.pointerId);
+			if (touches.size < 2) pinch = null;
+			if (drag && drag.id === e.pointerId) {
+				if (drag.moved < 4 && onClick) onClick(e.clientX, e.clientY);
+				drag = null;
+			}
 		};
 		const wheel = (e: WheelEvent) => {
 			e.preventDefault();
@@ -160,7 +201,7 @@ export class Stage {
 
 	/** Move the target with the pointer (dx, dy in CSS pixels). */
 	pan(dx: number, dy: number) {
-		const k = (this.want.dist * 2 * Math.tan(FOV / 2)) / this.gpu.canvas.clientHeight;
+		const k = (this.want.dist * 2 * Math.tan(this.fov / 2)) / this.gpu.canvas.clientHeight;
 		const t = this.want.target;
 		for (let i = 0; i < 3; i++) t[i] += (-this.right[i] * dx + this.up[i] * dy) * k;
 		this.view.target = [...t] as V3;
@@ -203,7 +244,7 @@ export class Stage {
 		const box = this.gpu.canvas.getBoundingClientRect();
 		const nx = ((clientX - box.left) / box.width) * 2 - 1,
 			ny = 1 - ((clientY - box.top) / box.height) * 2;
-		const t = Math.tan(FOV / 2),
+		const t = Math.tan(this.fov / 2),
 			aspect = box.width / box.height;
 		const d = vec3.normalize(
 			vec3.add(
@@ -231,7 +272,7 @@ export class Stage {
 
 	/** World units per CSS pixel at a distance from the eye. */
 	unitsPerPixel(depth: number) {
-		return (depth * 2 * Math.tan(FOV / 2)) / this.gpu.canvas.clientHeight;
+		return (depth * 2 * Math.tan(this.fov / 2)) / this.gpu.canvas.clientHeight;
 	}
 
 	private resize() {
@@ -281,7 +322,7 @@ export class Stage {
 		];
 		const near = Math.max(1e-5, v.dist * 0.01),
 			far = v.dist * 60 + 3000;
-		const proj = mat4.perspective(FOV, aspect, near, far);
+		const proj = mat4.perspective(this.fov, aspect, near, far);
 		const view = mat4.lookAt(eye, v.target, [0, 1, 0]);
 		this.viewProj = mat4.multiply(proj, view);
 		const fwd = vec3.normalize(vec3.subtract(v.target, eye));
@@ -296,7 +337,7 @@ export class Stage {
 		f.set([...this.right, 0], 16);
 		f.set([...this.up, 0], 20);
 		f.set([...eye, 1], 24);
-		f.set([this.time, aspect, (2 * Math.tan(FOV / 2)) / canvas.height, 0], 28);
+		f.set([this.time, aspect, (2 * Math.tan(this.fov / 2)) / canvas.height, 0], 28);
 		this.device.queue.writeBuffer(this.frame, 0, f);
 
 		const enc = this.device.createCommandEncoder();

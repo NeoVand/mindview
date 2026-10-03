@@ -3,6 +3,16 @@
 	import type { Painter } from '$lib/runtime/painter';
 	import { Stage } from '$lib/lab/stage';
 	import { Machine, type CellInfo, type MachineLabel } from '$lib/lab/machine';
+	import Status from '$lib/ui/Status.svelte';
+	import NeedsComputer from '$lib/ui/NeedsComputer.svelte';
+	import { mayLoad } from '$lib/lab/device';
+	import Activity from '@lucide/svelte/icons/activity';
+	import Grid3x3 from '@lucide/svelte/icons/grid-3x3';
+	import Sun from '@lucide/svelte/icons/sun';
+	import FastForward from '@lucide/svelte/icons/fast-forward';
+	import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
+	import Scan from '@lucide/svelte/icons/scan';
+	import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
 	let machine: Machine | undefined;
 	let stage: Stage | undefined;
@@ -10,6 +20,7 @@
 	let progress = $state(0);
 	let ready = $state(false);
 	let error = $state<string | null>(null);
+	let blocked = $state<{ why: string; go: () => void } | null>(null); // the models may not fit here
 	let prompt = $state('a bonsai tree made of glowing circuitry in a dark museum, volumetric light');
 	let words = $state<string[]>([]);
 	let chosen = $state(0);
@@ -20,6 +31,7 @@
 	let prediction = $state('');
 	let labels = $state<MachineLabel[]>([]);
 	let tip = $state<{ x: number; y: number; info: CellInfo } | null>(null);
+	let more = $state(true); // on a phone the choices under the prompt can be folded away
 	let revealing = $state(false);
 	let painter: Painter | undefined;
 	let paint = $state<{ fraction: number; text: string } | null>(null);
@@ -46,6 +58,9 @@
 		canvas.addEventListener('pointermove', hover);
 		canvas.addEventListener('pointerleave', leave);
 		(async () => {
+			// the labs keep about 3 GB on the GPU: on a phone, ask first
+			await mayLoad(3, 890, (why, go) => (blocked = { why, go }));
+			blocked = null;
 			const gpu = await labGPU(canvas);
 			loading = 'Loading Ternary Bonsai 1.7B (460 MB, kept after the first time)';
 			const llm = await labModel(gpu.device, (f) => (progress = f));
@@ -130,12 +145,13 @@
 
 <svelte:head><title>The machine</title></svelte:head>
 
-<main>
+<main class="lab-main">
 	<canvas
+		class="lab-canvas"
 		{@attach mount}
-		aria-label="Every weight of the model on one wall; drag to turn, right-drag to move, scroll to come closer"
+		aria-label="Every weight of the model on one wall; drag to turn, right-drag or two fingers to move, scroll or pinch to come closer"
 	></canvas>
-	<div class="labels" aria-hidden="true">
+	<div class="lab-labels" aria-hidden="true">
 		{#each labels as l, i (i)}
 			<span
 				style:left="{l.x}px"
@@ -145,112 +161,139 @@
 			>
 		{/each}
 	</div>
-	{#if error}
-		<p class="note" role="alert">{error}</p>
+	{#if blocked}
+		<NeedsComputer why={blocked.why} ontry={blocked.go} />
+	{:else if error}
+		<Status text={error} error />
 	{:else if !ready}
-		<div class="note">
-			<p>{loading}</p>
-			<div class="bar"><span style:transform="scaleX({progress})"></span></div>
-		</div>
+		<Status text={loading} {progress} />
 	{:else}
-		<form onsubmit={submit}>
-			<textarea
-				bind:value={prompt}
-				onkeydown={promptKey}
-				rows="1"
-				aria-label="Type something for the model to read; Enter to read it"
-				spellcheck="false"></textarea>
-			<div class="words" role="group" aria-label="Choose the word whose computation is shown">
-				{#each words as w, i (i)}
-					<button type="button" class:on={i === chosen} onclick={() => choose(i)}>{w}</button>
-				{/each}
-			</div>
-			<div class="options">
-				<div class="toggle" role="group" aria-label="What the cells show">
-					<button
-						type="button"
-						class:on={mode === 'work'}
-						onclick={() => {
-							mode = 'work';
-							machine?.setMode('work');
-						}}>Weights at work</button
-					>
-					<button
-						type="button"
-						class:on={mode === 'weights'}
-						onclick={() => {
-							mode = 'weights';
-							machine?.setMode('weights');
-						}}>Weights alone</button
-					>
-				</div>
-				<label>
-					<input
-						type="checkbox"
-						bind:checked={sorted}
-						onchange={() => machine?.setSorted(sorted)}
-					/>
-					Gather the busiest lines
-				</label>
-				<label>
-					Brightness
-					<input
-						type="range"
-						min="0.03"
-						max="3"
-						step="0.01"
-						bind:value={exposure}
-						oninput={() => machine?.setExposure(exposure)}
-					/>
-				</label>
-				{#if revealing}
-					<button type="button" onclick={() => machine?.skip()}>Show all</button>
-				{:else}
-					<button type="button" onclick={() => machine?.play()}>Replay in order</button>
-				{/if}
-				<button type="button" onclick={() => machine?.overview()}>Whole machine</button>
-			</div>
-			<div class="options">
-				<div class="toggle" role="group" aria-label="The painting step shown">
-					<span class="lead">Painting step</span>
-					{#each [1, 2, 3, 4] as n (n)}
-						<button type="button" class:on={step === n} onclick={() => setStep(n)}>{n}</button>
-					{/each}
-				</div>
-				<span class="hint"
-					>{following === 'word'
-						? 'Following the word through the painter. Click the finished picture to follow a patch of it.'
-						: 'Following a patch of the picture (●). Click another, or a word above, to follow it instead.'}</span
+		<form onsubmit={submit} class="lab-ask" class:folded={!more}>
+			<div class="top">
+				<textarea
+					class="prompt"
+					bind:value={prompt}
+					onkeydown={promptKey}
+					rows="1"
+					aria-label="Type something for the model to read; Enter to read it"
+					spellcheck="false"></textarea>
+				<button
+					type="button"
+					class="btn quiet icon more-toggle"
+					aria-label={more ? 'Hide the choices' : 'Show the choices'}
+					aria-expanded={more}
+					onclick={() => (more = !more)}><SlidersHorizontal /></button
 				>
 			</div>
+			<div class="more">
+				<div class="chips" role="group" aria-label="Choose the word whose computation is shown">
+					{#each words as w, i (i)}
+						<button type="button" class="chip" aria-pressed={i === chosen} onclick={() => choose(i)}
+							>{w}</button
+						>
+					{/each}
+				</div>
+				<div class="lab-options">
+					<div class="seg" role="group" aria-label="What the cells show">
+						<button
+							type="button"
+							aria-pressed={mode === 'work'}
+							onclick={() => {
+								mode = 'work';
+								machine?.setMode('work');
+							}}><Activity />Weights at work</button
+						>
+						<button
+							type="button"
+							aria-pressed={mode === 'weights'}
+							onclick={() => {
+								mode = 'weights';
+								machine?.setMode('weights');
+							}}><Grid3x3 />Weights alone</button
+						>
+					</div>
+					<label class="field">
+						<input
+							type="checkbox"
+							bind:checked={sorted}
+							onchange={() => machine?.setSorted(sorted)}
+						/>
+						Gather the busiest lines
+					</label>
+					<label class="field" title="Brightness">
+						<Sun size={16} />
+						<span class="sr-only">Brightness</span>
+						<input
+							type="range"
+							min="0.03"
+							max="3"
+							step="0.01"
+							bind:value={exposure}
+							oninput={() => machine?.setExposure(exposure)}
+						/>
+					</label>
+				</div>
+				<div class="lab-options">
+					{#if revealing}
+						<button type="button" class="btn" onclick={() => machine?.skip()}
+							><FastForward />Show all</button
+						>
+					{:else}
+						<button type="button" class="btn" onclick={() => machine?.play()}
+							><RotateCcw />Replay in order</button
+						>
+					{/if}
+					<button type="button" class="btn" onclick={() => machine?.overview()}
+						><Scan />Whole machine</button
+					>
+					<div class="field">
+						<span>Painting step</span>
+						<div class="seg" role="group" aria-label="The painting step shown">
+							{#each [1, 2, 3, 4] as n (n)}
+								<button type="button" aria-pressed={step === n} onclick={() => setStep(n)}
+									>{n}</button
+								>
+							{/each}
+						</div>
+					</div>
+				</div>
+				<p class="hint">
+					{following === 'word'
+						? 'Following the word through the painter. Click the finished picture to follow a patch of it.'
+						: 'Following a patch of the picture (●). Click another, or a word above, to follow it instead.'}
+				</p>
+			</div>
 		</form>
-		{#if painterNote || (paint && paint.text)}
-			<p class="aside">
-				{painterNote || paint?.text}
-				{#if paint && paint.fraction < 1}<span class="bar small"
-						><span style:transform="scaleX({paint.fraction})"></span></span
-					>{/if}
-			</p>
-		{/if}
-		<p class="caption" aria-live="polite">
-			{#if busy}
-				{busy}…
-			{:else if mode === 'work'}
-				Left, the reader's 1.4 billion ternary weights; right, the painter's 3.7 billion, lit as it
-				paints. Each cell is a weight times the number it multiplies for
-				{following === 'word' ? `“${words[chosen]}”` : 'the chosen patch of the picture'}: a word
-				goes through the reader, the adapter and the painter's word weights; a patch through the
-				picture weights; both through the single blocks. Scroll into any cell to read it.
-				{#if prediction && following === 'word'}The reader's own guess for the next word:
-					<em>{prediction}</em>.{/if}
-			{:else}
-				The weights alone: −1 (blue), +1 (amber), 0 (dark), each times its group's scale. On their
-				own they look like static; switch back to see them at work.
-			{/if}
-		</p>
+		<div class="lab-bottom">
+			<div class="glass lab-narrator">
+				<p class="narration" aria-live="polite">
+					{#if busy}
+						{busy}…
+					{:else if mode === 'work'}
+						Left, the reader's 1.4 billion ternary weights; right, the painter's 3.7 billion, lit as
+						it paints. Each cell is a weight times the number it multiplies for
+						{following === 'word' ? `“${words[chosen]}”` : 'the chosen patch of the picture'}: a
+						word goes through the reader, the adapter and the painter's word weights; a patch
+						through the picture weights; both through the single blocks. Scroll into any cell to
+						read it.
+						{#if prediction && following === 'word'}The reader's own guess for the next word:
+							<em>{prediction}</em>.{/if}
+					{:else}
+						The weights alone: −1 (blue), +1 (amber), 0 (dark), each times its group's scale. On
+						their own they look like static; switch back to see them at work.
+					{/if}
+				</p>
+				{#if painterNote || (paint && paint.text)}
+					<p class="hint">{painterNote || paint?.text}</p>
+					{#if paint && paint.fraction < 1}<div class="progress">
+							<span style:transform="scaleX({paint.fraction})"></span>
+						</div>{/if}
+				{/if}
+			</div>
+		</div>
 	{/if}
 	{#if tip}
-		<div class="tip" style:left="{tip.x + 16}px" style:top="{tip.y + 16}px">
+		<div class="tip glass" style:left="{tip.x + 16}px" style:top="{tip.y + 16}px">
 			<strong>{tip.info.title}</strong>
 			{#each tip.info.lines as line, i (i)}
 				<span>{line}</span>
@@ -260,196 +303,21 @@
 </main>
 
 <style>
-	main {
-		position: fixed;
-		inset: 0;
-		background: var(--void);
+	.lab-ask {
+		width: min(46rem, calc(100% - 2 * var(--gutter) - 19rem));
 	}
-	canvas {
-		position: absolute;
-		inset: 0;
-		width: 100%;
-		height: 100%;
-		touch-action: none;
-		cursor: grab;
-	}
-	canvas:active {
-		cursor: grabbing;
-	}
-	.labels span {
-		position: absolute;
-		transform: translate(-50%, -50%);
-		color: var(--bone);
-		white-space: nowrap;
-		pointer-events: none;
-		font-weight: 300;
-	}
-	form {
-		position: absolute;
-		left: 2.2rem;
-		top: 3.2rem;
-		width: min(46rem, 70vw);
-	}
-	textarea {
-		display: block;
-		width: 100%;
-		max-height: 20vh;
-		field-sizing: content;
-		resize: none;
-		background: none;
-		border: none;
-		border-bottom: 1px solid rgb(232 226 214 / 0.2);
-		color: var(--bone);
-		font: italic 300 clamp(1.05rem, 1.5vw, 1.6rem) / 1.3 var(--serif);
-		padding: 0.3rem 0;
-		outline: none;
-	}
-	textarea:focus-visible {
-		border-bottom-color: var(--ember);
-	}
-	.words {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.3rem 0.5rem;
-		margin-top: 0.6rem;
-	}
-	.words button {
-		background: none;
-		border: none;
-		border-bottom: 1px solid transparent;
-		color: var(--bone);
-		opacity: 0.5;
-		font: inherit;
-		font-size: 0.9rem;
-		padding: 0.05rem 0.1rem;
-		cursor: pointer;
-	}
-	.words button.on {
-		opacity: 1;
-		border-bottom-color: var(--ember);
-	}
-	.options {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.8rem 1.2rem;
-		margin-top: 0.8rem;
-		font-size: 0.82rem;
-		color: var(--bone);
-	}
-	.options label {
-		display: flex;
-		align-items: center;
-		gap: 0.45rem;
-		opacity: 0.75;
-	}
-	.toggle {
-		display: flex;
-	}
-	.toggle button {
-		opacity: 0.5;
-	}
-	.toggle button.on {
-		opacity: 1;
-		border-color: var(--ember);
-	}
-	.toggle button + button {
-		border-left: none;
-	}
-	button {
-		background: none;
-		border: 1px solid rgb(232 226 214 / 0.3);
-		color: var(--bone);
-		font: inherit;
-		font-size: 0.82rem;
-		padding: 0.25rem 0.7rem;
-		cursor: pointer;
-	}
-	button:focus-visible,
-	input:focus-visible {
-		outline: 1px solid var(--ember);
-		outline-offset: 2px;
-	}
-	input[type='range'] {
-		accent-color: var(--ember);
-		width: 7rem;
-	}
-	input[type='checkbox'] {
-		accent-color: var(--ember);
-	}
-	.caption,
-	.note {
-		position: absolute;
-		left: 2.2rem;
-		bottom: 2rem;
-		max-width: 64ch;
-		margin: 0;
-		font-weight: 300;
-		line-height: 1.5;
-		color: var(--bone);
-		opacity: 0.78;
-		pointer-events: none;
-	}
-	.caption em {
-		font-style: italic;
-		opacity: 1;
-	}
-	.bar {
-		height: 1px;
-		width: min(28rem, 60vw);
-		margin-top: 0.8rem;
-		background: rgb(232 226 214 / 0.15);
-	}
-	.bar span {
-		display: block;
-		height: 100%;
-		background: var(--ember);
-		transform-origin: left;
-	}
-	.tip {
-		position: absolute;
-		z-index: 10;
-		display: flex;
-		flex-direction: column;
-		gap: 0.15rem;
-		padding: 0.55rem 0.75rem;
-		background: rgb(10 10 10 / 0.88);
-		border: 1px solid rgb(232 226 214 / 0.18);
-		color: var(--bone);
-		font-size: 0.82rem;
-		font-variant-numeric: tabular-nums;
-		pointer-events: none;
-		max-width: 26rem;
-	}
-	.aside {
-		position: absolute;
-		right: 1.4rem;
-		top: 3.2rem;
-		margin: 0;
-		font-size: 0.82rem;
-		color: var(--bone);
-		opacity: 0.7;
-		display: flex;
-		flex-direction: column;
-		align-items: flex-end;
-		gap: 0.4rem;
-	}
-	.bar.small {
-		display: block;
-		width: 14rem;
+	.lab-ask .hint {
 		margin: 0;
 	}
-	.lead {
-		margin-right: 0.6rem;
-		opacity: 0.75;
-		align-self: center;
+	.lab-narrator .hint {
+		margin: 0.5rem 0 0;
 	}
-	.hint {
-		opacity: 0.55;
-		font-style: italic;
+	.lab-narrator .progress {
+		margin-top: 0.5rem;
 	}
-	.tip strong {
-		font-weight: 400;
-		color: var(--ember);
+	@media (max-width: 900px) {
+		.lab-ask {
+			width: calc(100% - 2 * var(--gutter));
+		}
 	}
 </style>
