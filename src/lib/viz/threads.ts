@@ -752,6 +752,8 @@ export class Threads {
 		this.starts.push(t);
 		this.total = t + 4;
 		this.time = 0;
+		this.handoffAt = -1;
+		this.paintFront = 0;
 		if (idle) {
 			// the reading as the run left it
 			this.time = this.starts[NL] + 1;
@@ -998,7 +1000,8 @@ export class Threads {
 			}
 		}
 		this.painting?.update();
-		if (this.ready && prog >= NL && this.handoffAt < 0) this.handoffAt = this.time;
+		// (not while a new prompt is being read: the last run's clock still stands at its end then)
+		if (this.ready && !this.reading && prog >= NL && this.handoffAt < 0) this.handoffAt = this.time;
 		// the GPU queue: bigger slices while nothing on screen needs to stay smooth (the reading, the handoff); while
 		// the painting is on show, never less than a third of each frame, however heavy the scene
 		const frameMs = this.scheduler.frameMs;
